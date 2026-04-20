@@ -62,6 +62,9 @@ public class ControlPanel extends VBox {
     public static final String DEFAULT_SLOW_DOWN_TURN_DEGREES = String.format(Locale.US, "%.1f", 60.0);
     public static final String DEFAULT_SLOW_DOWN_TURN_AMOUNT = String.format(Locale.US, "%.1f", 0.6);
 
+    // --- SPACING CONSTANTS ---
+    private static final int SECTION_SPACING = 5;
+
 
     public ControlPanel(double preferredWidth) {
         // --- SPACING CHANGE 1: Reduced main VBox spacing from 10 to 6 ---
@@ -72,12 +75,11 @@ public class ControlPanel extends VBox {
 
         // --- SPACING CHANGE 2: Reduced title font size from 16 to 15 ---
         Font titleFont = Font.font("Arial", FontWeight.BOLD, 15);
-        // --- SPACING CHANGE 3: Reduced internal VBox spacing from 8 to 5 ---
-        final int sectionSpacing = 5;
 
         // --- Path Management Section ---
         Label pathTitle = new Label("Path Management");
         pathTitle.setFont(titleFont);
+
         newPathButton = createMaxWidthButton("New Path");
         deletePathButton = createMaxWidthButton("Delete Path");
         importCodeButton = createMaxWidthButton("Import Code");
@@ -105,7 +107,7 @@ public class ControlPanel extends VBox {
         HBox.setHgrow(importCodeButton, Priority.ALWAYS);
         HBox.setHgrow(exportCodeButton, Priority.ALWAYS);
 
-        VBox pathControlsBox = new VBox(sectionSpacing, pathTitle, newDeleteBox, importExportBox, sendPathBox);
+        VBox pathControlsBox = new VBox(SECTION_SPACING, pathTitle, newDeleteBox, importExportBox, sendPathBox);
 
 
         // --- Robot Start Position Section ---
@@ -125,7 +127,7 @@ public class ControlPanel extends VBox {
         robotStartGrid.add(startYField, 1, 1);
         robotStartGrid.add(new Label("Start Heading:"), 0, 2);
         robotStartGrid.add(startHeadingField, 1, 2);
-        VBox robotStartBox = new VBox(sectionSpacing, robotStartTitle, robotStartGrid);
+        VBox robotStartBox = new VBox(SECTION_SPACING, robotStartTitle, robotStartGrid);
 
 
         // --- Path Parameters Section ---
@@ -147,6 +149,8 @@ public class ControlPanel extends VBox {
         followAngleGrid.setHgap(10);
         followAngleGrid.setVgap(6);
         followAngleGrid.add(new Label("Follow Angle (Deg):"), 0, 0);
+        followAngleField.setMinWidth(70);
+        followAngleField.setPrefWidth(70);
         followAngleGrid.add(followAngleField, 1, 0);
         // --- END NEW ---
 
@@ -157,14 +161,14 @@ public class ControlPanel extends VBox {
 
         // --- SPACING CHANGE 4 (continued): Reduced GridPane vgap from 8 to 6 ---
         GridPane paramsGrid = createParametersGrid(6);
-        VBox curveParamsBox = new VBox(sectionSpacing, paramsTitle, followAngleGrid, pointSelectionComboBox, paramsGrid);
+        VBox curveParamsBox = new VBox(SECTION_SPACING, paramsTitle, followAngleGrid, pointSelectionComboBox, paramsGrid);
 
         // --- Utility Controls Section ---
         Label utilityTitle = new Label("Utilities");
         utilityTitle.setFont(titleFont);
         clearTrailButton = createMaxWidthButton("Clear Robot Trail");
         clearNamedLinesButton = createMaxWidthButton("Clear Custom Lines");
-        VBox utilityControlsBox = new VBox(sectionSpacing, utilityTitle, clearTrailButton, clearNamedLinesButton);
+        VBox utilityControlsBox = new VBox(SECTION_SPACING, utilityTitle, clearTrailButton, clearNamedLinesButton);
 
 
         // --- Recording Controls Section ---
@@ -184,6 +188,8 @@ public class ControlPanel extends VBox {
         playPauseButton.setGraphic(playIcon);
         reverseButton = new Button();
         reverseButton.setGraphic(reverseIcon);
+        forwardButton = new Button();
+        forwardIcon = new ImageView(new Image(getClass().getResourceAsStream("/icons/forward.png"), 20, 20, true, true));
         forwardButton = new Button();
         forwardButton.setGraphic(forwardIcon);
         HBox recordingButtons = new HBox(10, reverseButton, playPauseButton, forwardButton, recordButton);
@@ -207,11 +213,11 @@ public class ControlPanel extends VBox {
         timeLapsedLabel.setAlignment(Pos.CENTER_RIGHT);
         timeLapsedLabel.setPadding(new Insets(2, 0, 0, 0));
 
-        VBox recordingControlsBox = new VBox(sectionSpacing, recordingTitle, fileButtons, recordingButtons, replayControlsBox, timelineSlider, timeLapsedLabel);
+        VBox recordingControlsBox = new VBox(SECTION_SPACING, recordingTitle, fileButtons, recordingButtons, replayControlsBox, timelineSlider, timeLapsedLabel);
 
         // --- Tools Section ---
         showPlotButton = createMaxWidthButton("Show Time Plot");
-        VBox toolsControlsBox = new VBox(sectionSpacing, showPlotButton);
+        VBox toolsControlsBox = new VBox(SECTION_SPACING, showPlotButton);
 
         // --- Initial State ---
         enablePathControls(false);
@@ -227,7 +233,7 @@ public class ControlPanel extends VBox {
         GridPane paramsGrid = new GridPane();
         paramsGrid.setHgap(10);
         paramsGrid.setVgap(vgap);
-        paramsGrid.setPadding(new Insets(5, 0, 5, 0)); // Reduced top/bottom padding
+        paramsGrid.setPadding(new Insets(SECTION_SPACING, 0, SECTION_SPACING, 0)); // Reduced top/bottom padding
 
         ColumnConstraints column1 = new ColumnConstraints();
         column1.setMinWidth(110); // Slightly reduced min width
@@ -529,4 +535,3 @@ public class ControlPanel extends VBox {
     public double getSlowDownTurnDegreesParam() throws NumberFormatException { return Double.parseDouble(slowDownTurnDegreesField.getText()); }
     public double getSlowDownTurnAmountParam() throws NumberFormatException { return Double.parseDouble(slowDownTurnAmountField.getText()); }
 }
-

@@ -4,6 +4,7 @@ import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.value.ChangeListener;
 import javafx.beans.value.ObservableValue;
+import javafx.collections.FXCollections;
 import javafx.geometry.Insets;
 import javafx.geometry.Point2D;
 import javafx.geometry.Pos;
@@ -28,6 +29,7 @@ import javafx.scene.control.ButtonType;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.ButtonBar;
+import javafx.scene.control.ComboBox;
 
 import com.example.ftcfieldsimulator.UdpPositionListener.CircleData;
 import com.example.ftcfieldsimulator.UdpPositionListener.KeyValueData;
@@ -79,8 +81,9 @@ public class FtcFieldSimulatorApp extends Application {
     private Map<String, LineData> namedLinesToDraw = new HashMap<>();
     private final Object namedLinesLock = new Object();
     private Map<TextField, String> textFieldPreviousValues = new HashMap<>();
+    private boolean isRedAlliance = false; // State to track current alliance view
 
-    // --- Configuration Constants (omitted for brevity, no changes here) ---
+    // --- Configuration Constants ---
     public static final double FIELD_WIDTH_INCHES = 144.0;
     public static final double FIELD_HEIGHT_INCHES = 144.0;
     private static final int FIELD_DISPLAY_WIDTH_PIXELS = 800;
@@ -118,7 +121,6 @@ public class FtcFieldSimulatorApp extends Application {
         double totalAppHeight = FIELD_DISPLAY_HEIGHT_PIXELS;
 
         // --- Init core components ---
-//        this.recordingManager = new RecordingManager(this::handleUdpMessage, this::onPlaybackFinished);
         this.recordingManager = new RecordingManager(this::processUdpDataAndUpdateUI, this::onPlaybackFinished);
         recordingManager.setOnProgressUpdate(index -> {
             if (controlPanel != null && controlPanel.getTimelineSlider() != null && !controlPanel.getTimelineSlider().isValueChanging()) {
@@ -147,7 +149,6 @@ public class FtcFieldSimulatorApp extends Application {
 
         // --- Assemble the right-side panel ---
         VBox rightPanel = new VBox();
-        // The keyValueTable will grow to fill available vertical space. The status display will be its natural height.
         VBox.setVgrow(keyValueTable, Priority.ALWAYS);
         rightPanel.getChildren().addAll(keyValueTable, fieldStatusDisplay);
 
@@ -181,126 +182,75 @@ public class FtcFieldSimulatorApp extends Application {
         updateTimeLapsedDisplay();
     }
 
-    // --- To set up the delete action ---
     private void setupFieldDisplayKeyHandlers() {
         if (fieldDisplay == null) return;
-
-        // Set the action for when the delete key is pressed on a point
         fieldDisplay.setOnPointDeleteAction(this::handleDeletePoint);
     }
 
-    // --- To handle the logic of deleting a point ---
     private void handleDeletePoint(CurvePoint pointToDelete) {
         if (pointToDelete == null || !currentPath.contains(pointToDelete)) return;
 
         int deletedIndex = currentPath.indexOf(pointToDelete);
         currentPath.remove(pointToDelete);
 
-        // If the first point was deleted, the robot's start position must be updated
         if (deletedIndex == 0 && !currentPath.isEmpty()) {
             CurvePoint newFirstPoint = currentPath.get(0);
             robot.setPosition(newFirstPoint.x, newFirstPoint.y);
-            // The robot's heading remains unchanged in this case
             controlPanel.updateRobotStartFields(newFirstPoint.x, newFirstPoint.y, robot.getHeadingDegrees());
         }
 
-        // Refresh the UI to reflect the change
-        fieldDisplay.setHighlightedPoint(null); // Clear any highlight
+        fieldDisplay.setHighlightedPoint(null);
         fieldDisplay.setPathToDraw(currentPath);
-        updateControlPanelForPathState(); // This will update the ComboBox and other controls
-        updateUIFromRobotState(); // Redraw everything
+        updateControlPanelForPathState();
+        updateUIFromRobotState();
 
         instructionLabel.setText("Deleted Point " + (deletedIndex + 1) + ".");
     }
 
-    /**
-     * Sets up the mouse interaction handlers for the FieldDisplay canvas.
-     * This connects the UI events for dragging points to the application logic.
-     */
     private void setupFieldDisplayMouseHandlers() {
         if (fieldDisplay == null) return;
-
-        // --- Handler for clicking on a segment ---
         fieldDisplay.setOnSegmentClick(this::handleInsertPoint);
-
-        // Handler for while the mouse is being dragged
         fieldDisplay.setOnPointDrag((index, newCoords) -> {
-            // The point object in currentPath is updated by reference.
-            // We just need to update the UI.
-
-            // If this is the first point, also update the Robot Start fields
             if (index == 0) {
                 controlPanel.updateRobotStartFields(newCoords.getX(), newCoords.getY(), robot.getHeadingDegrees());
-                // Also update the robot's internal position to match
                 robot.setPosition(newCoords.getX(), newCoords.getY());
             }
-
-            // Ensure the dragged point is selected in the ComboBox
             if (controlPanel.getSelectedPointFromComboBox() != currentPath.get(index)) {
                 controlPanel.updatePointSelectionComboBox(currentPath, currentPath.get(index));
             }
-
-            // Update the parameter text fields to show the new X/Y
             controlPanel.loadParametersForPoint(currentPath.get(index));
-
             instructionLabel.setText(String.format(Locale.US, "Dragging Point %d to (X:%.1f, Y:%.1f)",
                     index + 1, newCoords.getX(), newCoords.getY()));
         });
 
-        // Handler for when the drag operation ends
         fieldDisplay.setOnPointDragEnd(index -> {
             if (index >= 0 && index < currentPath.size()) {
                 CurvePoint point = currentPath.get(index);
                 instructionLabel.setText(String.format(Locale.US, "Moved Point %d.", index + 1));
-
-                // Refresh the ComboBox text to show the new coordinates
                 controlPanel.updatePointSelectionComboBox(currentPath, point);
             }
         });
     }
 
-    // --- To handle the logic of inserting a new point ---
     private void handleInsertPoint(int segmentIndex, Point2D clickCoordsPixels) {
-        if (segmentIndex < 0 || segmentIndex >= currentPath.size() - 1) {
-            return; // Invalid index
-        }
+        if (segmentIndex < 0 || segmentIndex >= currentPath.size() - 1) return;
 
-        // Convert click coordinates from pixels to field inches
         Point2D clickCoordsInches = fieldDisplay.pixelToInches(clickCoordsPixels.getX(), clickCoordsPixels.getY());
-
-        // Get the points that define the segment
         CurvePoint startPoint = currentPath.get(segmentIndex);
         CurvePoint endPoint = currentPath.get(segmentIndex + 1);
 
-        // Interpolate the parameters for the new point (simple average)
         double newMoveSpeed = (startPoint.moveSpeed + endPoint.moveSpeed) / 2.0;
         double newTurnSpeed = (startPoint.turnSpeed + endPoint.turnSpeed) / 2.0;
         double newFollowDistance = (startPoint.followDistance + endPoint.followDistance) / 2.0;
         double newSlowDownTurnRadians = (startPoint.slowDownTurnRadians + endPoint.slowDownTurnRadians) / 2.0;
         double newSlowDownTurnAmount = (startPoint.slowDownTurnAmount + endPoint.slowDownTurnAmount) / 2.0;
 
-        // Create the new point at the clicked location with interpolated parameters
-        CurvePoint newPoint = new CurvePoint(
-                clickCoordsInches.getX(),
-                clickCoordsInches.getY(),
-                newMoveSpeed,
-                newTurnSpeed,
-                newFollowDistance,
-                newSlowDownTurnRadians,
-                newSlowDownTurnAmount
-        );
-
-        // Insert the new point into the path right after the start of the segment
+        CurvePoint newPoint = new CurvePoint(clickCoordsInches.getX(), clickCoordsInches.getY(), newMoveSpeed, newTurnSpeed, newFollowDistance, newSlowDownTurnRadians, newSlowDownTurnAmount);
         currentPath.add(segmentIndex + 1, newPoint);
-
-        // After modifying the path list, we must explicitly tell the display
-        // to use the new version for its next drawing cycle.
         fieldDisplay.setPathToDraw(currentPath);
-
-        // Refresh the entire UI
-        fieldDisplay.setHighlightedPoint(newPoint); // Highlight the newly created point
-        updateControlPanelForPathState(); // This will update the ComboBox to include the new point
-        updateUIFromRobotState(); // Redraw everything
+        fieldDisplay.setHighlightedPoint(newPoint);
+        updateControlPanelForPathState();
+        updateUIFromRobotState();
 
         instructionLabel.setText("Inserted new point " + (segmentIndex + 2) + ".");
     }
@@ -308,14 +258,12 @@ public class FtcFieldSimulatorApp extends Application {
     private void updateUIFromRobotState() {
         if (robot != null && fieldDisplay != null) {
             double displayHeading = robot.getHeadingDegrees() % 360;
-            if (displayHeading < 0) displayHeading += 360; // Normalize to 0-359
+            if (displayHeading < 0) displayHeading += 360;
 
-            // --- Send status update to the new display ---
             if (fieldStatusDisplay != null) {
                 fieldStatusDisplay.updateRobotStatus(robot.getXInches(), robot.getYInches(), displayHeading);
             }
 
-            // --- Update Robot Start Fields if they have focus ---
             if (controlPanel != null && (
                     controlPanel.getStartXField().isFocused() ||
                             controlPanel.getStartYField().isFocused() ||
@@ -328,39 +276,21 @@ public class FtcFieldSimulatorApp extends Application {
         }
     }
 
-    // ... all other methods from FtcFieldSimulatorApp remain the same ...
     private void showPlotDisplay() {
         if (plotDisplayWindow == null) {
-            plotDisplayWindow = new PlotDisplayWindow(primaryStage); // Pass primary stage as owner
+            plotDisplayWindow = new PlotDisplayWindow(primaryStage);
         }
         plotDisplayWindow.show();
     }
+
     private void handleUdpPlotData(PlotDataEvent dataEvent) {
         if (dataEvent == null) return;
-
         Platform.runLater(() -> {
-            // Log all received plot data for now
-            // System.out.println("App received PlotDataEvent: " + dataEvent);
-
-            // If PlotDisplayWindow is not yet created, create it.
-            // This ensures if data comes before user clicks button, window can still be prepared.
-            // However, it won't show until user clicks.
-            if (plotDisplayWindow == null) {
-                // plotDisplayWindow = new PlotDisplayWindow(primaryStage); // Create but don't show
-                // Let's only interact if it's already created and showing by user action
-            }
-
             if (plotDisplayWindow != null && plotDisplayWindow.isShowing()) {
                 PlotDisplay display = plotDisplayWindow.getPlotDisplay();
                 if (display != null) {
-                    // Pass the generic event. PlotDisplay will decide what to do.
                     display.addPlotEvent(dataEvent);
                 }
-            } else if (dataEvent instanceof PlotYLimitsEvent || dataEvent instanceof PlotYUnitsEvent) {
-                // Optional: If plot window isn't visible, maybe still store these global settings
-                // so when it becomes visible, it uses the latest known ones.
-                // For now, we only update if visible.
-                System.out.println("Plot window not visible. Discarding: " + dataEvent);
             }
         });
     }
@@ -384,20 +314,33 @@ public class FtcFieldSimulatorApp extends Application {
         controlPanel.setOnShowPlotAction(event -> showPlotDisplay());
     }
 
-    // --- To show the import dialog ---
+    private static class ImportResult {
+        String code;
+        boolean isRed;
+        ImportResult(String code, boolean isRed) {
+            this.code = code;
+            this.isRed = isRed;
+        }
+    }
+
     private void showImportCodeDialog() {
-        Dialog<String> dialog = new Dialog<>();
+        Dialog<ImportResult> dialog = new Dialog<>();
         dialog.setTitle("Import Path from Code");
-        dialog.setHeaderText("Paste your Java code snippet below.\nIt should contain 'new CurvePoint(...)' or 'new Pose2D(...)' lines.");
+        dialog.setHeaderText("Paste your Java code snippet below and select the alliance.");
         dialog.setResizable(true);
 
         TextArea textArea = new TextArea();
         textArea.setPromptText("pathToSpike1.add(new CurvePoint(...));");
         textArea.setFont(Font.font("Consolas", 14));
-        textArea.setPrefHeight(400);
+        textArea.setPrefHeight(300);
         textArea.setPrefWidth(650);
 
-        VBox content = new VBox(textArea);
+        ComboBox<String> allianceSelector = new ComboBox<>();
+        allianceSelector.getItems().addAll("Blue Alliance", "Red Alliance");
+        allianceSelector.setValue(isRedAlliance ? "Red Alliance" : "Blue Alliance");
+        allianceSelector.setMaxWidth(Double.MAX_VALUE);
+
+        VBox content = new VBox(10, new Label("Java Code Snippet:"), textArea, new Label("Alliance for this path:"), allianceSelector);
         VBox.setVgrow(textArea, Priority.ALWAYS);
         dialog.getDialogPane().setContent(content);
         dialog.getDialogPane().setPrefSize(650, 480);
@@ -407,41 +350,44 @@ public class FtcFieldSimulatorApp extends Application {
 
         dialog.setResultConverter(dialogButton -> {
             if (dialogButton == importButtonType) {
-                return textArea.getText();
+                return new ImportResult(textArea.getText(), "Red Alliance".equals(allianceSelector.getValue()));
             }
             return null;
         });
 
-        Optional<String> result = dialog.showAndWait();
-        result.ifPresent(this::parseAndImportPath);
+        Optional<ImportResult> result = dialog.showAndWait();
+        result.ifPresent(res -> parseAndImportPath(res.code, res.isRed));
     }
 
-    // --- NEW METHOD: To parse the pasted code and update the path ---
-    private void parseAndImportPath(String code) {
+    private void parseAndImportPath(String code, boolean importedAsRed) {
         List<CurvePoint> newPath = new ArrayList<>();
         double startX = -1, startY = -1, startHeading = 0;
         boolean poseFound = false;
 
-        // Regex to find "new Pose2D(..., X, Y, ..., H)"
-        Pattern posePattern = Pattern.compile("new\\s+Pose2D\\([^,]+,\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+),\\s*[^,]+,\\s*([\\d\\.\\-]+)\\)");
+        this.isRedAlliance = importedAsRed;
+        double allianceMultiplier = isRedAlliance ? -1.0 : 1.0;
 
-        // Regex to find "new CurvePoint(X, Y, mS, tS, fD, Math.toRadians(sDTd), sDTa)"
+        Pattern posePattern = Pattern.compile("new\\s+Pose2D\\([^,]+,\\s*([\\d\\.\\-]+),\\s*(?:y\\(([\\d\\.\\-]+)\\)|([\\d\\.\\-]+)),\\s*[^,]+,\\s*([\\d\\.\\-]+)\\)");
         Pattern curvePointPattern = Pattern.compile(
-                "new\\s+CurvePoint\\(\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+)," +
+                "new\\s+CurvePoint\\(\\s*([\\d\\.\\-]+),\\s*(?:y\\(([\\d\\.\\-]+)\\)|([\\d\\.\\-]+)),\\s*([\\d\\.\\-]+)," +
                         "\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+),\\s*Math\\.toRadians\\(([\\d\\.\\-]+)\\)," +
                         "\\s*([\\d\\.\\-]+)\\)"
         );
 
         String[] lines = code.split("\\r?\\n");
         for (String line : lines) {
-            // First, try to find a Pose2D line
             if (!poseFound) {
                 Matcher poseMatcher = posePattern.matcher(line);
                 if (poseMatcher.find()) {
                     try {
                         startX = Double.parseDouble(poseMatcher.group(1));
-                        startY = Double.parseDouble(poseMatcher.group(2));
-                        startHeading = Double.parseDouble(poseMatcher.group(3));
+                        String yGroupVal = poseMatcher.group(2);
+                        if (yGroupVal != null) {
+                            startY = Double.parseDouble(yGroupVal) * allianceMultiplier;
+                        } else {
+                            startY = Double.parseDouble(poseMatcher.group(3));
+                        }
+                        startHeading = Double.parseDouble(poseMatcher.group(4));
                         poseFound = true;
                     } catch (NumberFormatException e) {
                         System.err.println("Could not parse Pose2D line: " + line);
@@ -449,17 +395,22 @@ public class FtcFieldSimulatorApp extends Application {
                 }
             }
 
-            // Then, try to find a CurvePoint line
             Matcher curvePointMatcher = curvePointPattern.matcher(line);
             if (curvePointMatcher.find()) {
                 try {
                     double x = Double.parseDouble(curvePointMatcher.group(1));
-                    double y = Double.parseDouble(curvePointMatcher.group(2));
-                    double moveSpeed = Double.parseDouble(curvePointMatcher.group(3));
-                    double turnSpeed = Double.parseDouble(curvePointMatcher.group(4));
-                    double followDistance = Double.parseDouble(curvePointMatcher.group(5));
-                    double slowDownTurnDeg = Double.parseDouble(curvePointMatcher.group(6));
-                    double slowDownTurnAmount = Double.parseDouble(curvePointMatcher.group(7));
+                    double y;
+                    String yGroupVal = curvePointMatcher.group(2);
+                    if (yGroupVal != null) {
+                        y = Double.parseDouble(yGroupVal) * allianceMultiplier;
+                    } else {
+                        y = Double.parseDouble(curvePointMatcher.group(3));
+                    }
+                    double moveSpeed = Double.parseDouble(curvePointMatcher.group(4));
+                    double turnSpeed = Double.parseDouble(curvePointMatcher.group(5));
+                    double followDistance = Double.parseDouble(curvePointMatcher.group(6));
+                    double slowDownTurnDeg = Double.parseDouble(curvePointMatcher.group(7));
+                    double slowDownTurnAmount = Double.parseDouble(curvePointMatcher.group(8));
 
                     newPath.add(new CurvePoint(x, y, moveSpeed, turnSpeed, followDistance, Math.toRadians(slowDownTurnDeg), slowDownTurnAmount));
                 } catch (NumberFormatException e) {
@@ -473,30 +424,23 @@ public class FtcFieldSimulatorApp extends Application {
             return;
         }
 
-        // --- Apply the new path ---
-        // If no explicit Pose2D was found, use the first point of the path
         if (!poseFound) {
             CurvePoint firstPoint = newPath.get(0);
             startX = firstPoint.x;
             startY = firstPoint.y;
-            startHeading = 0.0; // Default heading
+            startHeading = 0.0;
         }
 
-        // Replace the current path
         this.currentPath = newPath;
-
-        // Update robot position and UI fields
         robot.setPosition(startX, startY, startHeading);
         controlPanel.updateRobotStartFields(startX, startY, startHeading);
-
-        // Update the rest of the UI
         fieldDisplay.setPathToDraw(this.currentPath);
         isCreatingPath = false;
         controlPanel.setPathEditingActive(false);
         updateControlPanelForPathState();
-        updateUIFromRobotState(); // Redraws everything
+        updateUIFromRobotState();
 
-        instructionLabel.setText("Successfully imported " + newPath.size() + " points.");
+        instructionLabel.setText("Successfully imported " + newPath.size() + " points for " + (isRedAlliance ? "RED" : "BLUE") + ".");
     }
 
     private void setupParameterFieldListeners() {
@@ -512,13 +456,12 @@ public class FtcFieldSimulatorApp extends Application {
             tf.setOnAction(event -> handleParameterFieldFocusLost(tf));
         }
 
-        // --- Listener for Robot Start Position parameters ---
         for (TextField tf : controlPanel.getRobotStartTextFields()) {
             tf.focusedProperty().addListener((obs, oldVal, newVal) -> {
                 if (newVal) {
                     textFieldPreviousValues.put(tf, tf.getText());
                 } else {
-                    handleRobotStartFieldFocusLost(); // A single handler for all 3 fields
+                    handleRobotStartFieldFocusLost();
                 }
             });
             tf.setOnAction(event -> handleRobotStartFieldFocusLost());
@@ -534,21 +477,19 @@ public class FtcFieldSimulatorApp extends Application {
             double newHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
 
             robot.setPosition(newX, newY, newHeading);
-            updateUIFromRobotState(); // Redraw robot at new position
+            updateUIFromRobotState();
 
-            // If a path exists, update its first point to match the new robot start position
             if (!currentPath.isEmpty()) {
                 CurvePoint firstPoint = currentPath.get(0);
                 firstPoint.x = newX;
                 firstPoint.y = newY;
-                fieldDisplay.drawCurrentState(); // Redraw the path
-                controlPanel.updatePointSelectionComboBox(currentPath, controlPanel.getSelectedPointFromComboBox()); // Refresh combo box text
+                fieldDisplay.drawCurrentState();
+                controlPanel.updatePointSelectionComboBox(currentPath, controlPanel.getSelectedPointFromComboBox());
             }
             instructionLabel.setText("Robot start position updated.");
 
         } catch (NumberFormatException e) {
             instructionLabel.setText("Invalid start position. Reverting.");
-            // Revert fields to the robot's actual current state
             updateUIFromRobotState();
         }
     }
@@ -557,14 +498,13 @@ public class FtcFieldSimulatorApp extends Application {
         if (controlPanel == null || currentPath == null) return;
 
         String previousText = textFieldPreviousValues.getOrDefault(textField, "");
-        String currentText = textField.getText().trim(); // Trim whitespace
+        String currentText = textField.getText().trim();
 
         if (Objects.equals(previousText, currentText) && !previousText.equals(ControlPanel.TEXTFIELD_VARIES_TEXT)) {
-            return; // No actual change, or was "-- Varies --" and still is (though user can't type that directly)
+            return;
         }
-        // If currentText becomes the "-- Varies --" text, it's likely a programmatic change, not user input for commit.
         if (currentText.equals(ControlPanel.TEXTFIELD_VARIES_TEXT)) {
-            textFieldPreviousValues.put(textField, currentText); // Update stored value if it was set programmatically
+            textFieldPreviousValues.put(textField, currentText);
             return;
         }
 
@@ -573,30 +513,23 @@ public class FtcFieldSimulatorApp extends Application {
 
         try {
             if (currentText.isEmpty()) {
-                // If "ALL" was selected and field showed "-- Varies --" and user cleared it
                 if (Objects.equals(selectedItem, ControlPanel.ALL_POINTS_MARKER) && previousText.equals(ControlPanel.TEXTFIELD_VARIES_TEXT)) {
-                    System.out.println("Field cleared for 'ALL' that showed '-- Varies --'. No update to points for this field.");
-                    // The field will remain empty. If another selection happens, it will be re-populated.
-                    // Or, we could force re-evaluation of "--Varies--" here, but it might be cleared by user.
-                    // For now, let it be empty. Selection change will refresh.
-                    textFieldPreviousValues.put(textField, currentText); // Store the empty state
+                    textFieldPreviousValues.put(textField, currentText);
                     return;
                 }
-                throw new NumberFormatException("Parameter cannot be empty."); // Empty is invalid for a specific point or for "ALL" when setting a value
+                throw new NumberFormatException("Parameter cannot be empty.");
             }
             parsedValue = Double.parseDouble(currentText);
 
-            // Add specific range validation if desired
             if (textField == controlPanel.getMoveSpeedField() && parsedValue <= 0) throw new NumberFormatException("Move speed must be > 0");
             if (textField == controlPanel.getTurnSpeedField() && parsedValue <= 0) throw new NumberFormatException("Turn speed must be > 0");
             if (textField == controlPanel.getFollowDistanceField() && parsedValue < 0) throw new NumberFormatException("Follow distance must be >= 0");
             if (textField == controlPanel.getSlowDownTurnAmountField() && (parsedValue < 0 || parsedValue > 1)) throw new NumberFormatException("Slow down amount must be 0.0-1.0");
-            // No specific range for slowDownTurnDegreesField here, but it's converted to radians.
 
         } catch (NumberFormatException e) {
             instructionLabel.setText("Invalid input: " + e.getMessage() + ". Reverting.");
-            textField.setText(previousText); // Revert
-            textFieldPreviousValues.put(textField, previousText); // Ensure map is correct
+            textField.setText(previousText);
+            textFieldPreviousValues.put(textField, previousText);
             return;
         }
 
@@ -607,7 +540,7 @@ public class FtcFieldSimulatorApp extends Application {
             }
             instructionLabel.setText("Applied '" + getFieldName(textField) + " = " + currentText + "' to all points.");
             updateOccurred = true;
-            refreshParameterFieldsForAllSelected(); // Refresh all fields for "ALL" view, as one change might make others uniform or varied
+            refreshParameterFieldsForAllSelected();
         } else if (selectedItem instanceof CurvePoint) {
             CurvePoint point = (CurvePoint) selectedItem;
             updateCurvePointParameter(point, textField, parsedValue);
@@ -617,8 +550,8 @@ public class FtcFieldSimulatorApp extends Application {
         }
 
         if (updateOccurred) {
-            textFieldPreviousValues.put(textField, currentText); // Update stored value after successful application
-            fieldDisplay.drawCurrentState(); // Redraw path if parameters affect appearance (though unlikely for these)
+            textFieldPreviousValues.put(textField, currentText);
+            fieldDisplay.drawCurrentState();
         }
     }
 
@@ -640,47 +573,34 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void handlePointSelectionChanged(ObservableValue<? extends Object> obs, Object oldVal, Object newVal) {
-        if (controlPanel == null || isCreatingPath) { // Do not change display if actively drawing path
+        if (controlPanel == null || isCreatingPath) {
             if (isCreatingPath && newVal != null && controlPanel.getSelectedPointFromComboBox() != null) {
-                // If drawing path and user somehow clicks ComboBox, try to revert to original selection if possible
-                // This is a bit defensive, ideally ComboBox is disabled during path creation
                 Platform.runLater(() -> controlPanel.updatePointSelectionComboBox(currentPath, oldVal != null ? oldVal : ControlPanel.ALL_POINTS_MARKER));
             }
             return;
         }
 
-        CurvePoint pointToHighlight = null; // Initialize to null (no highlight)
+        CurvePoint pointToHighlight = null;
 
         if (newVal == null) {
             if (currentPath.isEmpty()) {
                 controlPanel.loadGlobalDefaultsIntoParameterFields();
                 controlPanel.setPointEditingControlsDisabled(true);
             } else {
-                // Should default to "ALL" if path exists
                 controlPanel.updatePointSelectionComboBox(currentPath, ControlPanel.ALL_POINTS_MARKER);
-                // This will re-trigger the listener with "ALL"
             }
             return;
         } else if (Objects.equals(newVal, ControlPanel.ALL_POINTS_MARKER)) {
             refreshParameterFieldsForAllSelected();
-            // When "ALL" is selected, no specific point is highlighted
         } else if (newVal instanceof CurvePoint) {
             CurvePoint selectedCurvePoint = (CurvePoint) newVal;
             controlPanel.loadParametersForPoint(selectedCurvePoint);
-            pointToHighlight = selectedCurvePoint; // This is the point to highlight
+            pointToHighlight = selectedCurvePoint;
         }
 
-        System.out.println("ComboBox selection changed to: " + newVal);
-        if (Objects.equals(newVal, ControlPanel.ALL_POINTS_MARKER)) {
-            refreshParameterFieldsForAllSelected();
-        } else if (newVal instanceof CurvePoint) {
-            controlPanel.loadParametersForPoint((CurvePoint) newVal);
-        }
-
-        // Update the highlighted point in FieldDisplay and redraw
         if (fieldDisplay != null) {
             fieldDisplay.setHighlightedPoint(pointToHighlight);
-            fieldDisplay.drawCurrentState(); // Redraw the field to show highlight
+            fieldDisplay.drawCurrentState();
         }
     }
 
@@ -688,11 +608,9 @@ public class FtcFieldSimulatorApp extends Application {
         if (controlPanel == null) return;
         if (currentPath.isEmpty()) {
             controlPanel.loadGlobalDefaultsIntoParameterFields();
-            // Point editing controls should be disabled by updateControlPanelForPathState
             return;
         }
 
-        System.out.println("Refreshing for ALL points. Path size: " + currentPath.size());
         checkAndSetField(currentPath, cp -> cp.moveSpeed, controlPanel.getMoveSpeedField(), "%.2f");
         checkAndSetField(currentPath, cp -> cp.turnSpeed, controlPanel.getTurnSpeedField(), "%.2f");
         checkAndSetField(currentPath, cp -> cp.followDistance, controlPanel.getFollowDistanceField(), "%.1f");
@@ -701,8 +619,8 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private <T> void checkAndSetField(List<CurvePoint> path, Function<CurvePoint, T> getter, TextField field, String format) {
-        if (path.isEmpty()) { // Should be handled by calling context
-            loadSpecificGlobalDefault(field); // Fallback
+        if (path.isEmpty()) {
+            loadSpecificGlobalDefault(field);
             return;
         }
 
@@ -711,7 +629,7 @@ public class FtcFieldSimulatorApp extends Application {
         for (int i = 1; i < path.size(); i++) {
             T currentValue = getter.apply(path.get(i));
             if (currentValue instanceof Double && firstValue instanceof Double) {
-                if (Math.abs((Double) currentValue - (Double) firstValue) > 0.0001) { // Tolerance for double comparison
+                if (Math.abs((Double) currentValue - (Double) firstValue) > 0.0001) {
                     allSame = false;
                     break;
                 }
@@ -724,17 +642,16 @@ public class FtcFieldSimulatorApp extends Application {
         if (allSame) {
             if (firstValue instanceof Double) {
                 field.setText(String.format(Locale.US, format, (Double) firstValue));
-            } else { // Should not happen with current parameters but good for generic
+            } else {
                 field.setText(firstValue.toString());
             }
         } else {
             field.setText(ControlPanel.TEXTFIELD_VARIES_TEXT);
         }
-        textFieldPreviousValues.put(field, field.getText()); // Update stored value for focus lost checks
+        textFieldPreviousValues.put(field, field.getText());
     }
 
     private void loadSpecificGlobalDefault(TextField field) {
-        // Accessing static defaults from ControlPanel directly
         if (field == controlPanel.getMoveSpeedField()) field.setText(ControlPanel.DEFAULT_MOVE_SPEED);
         else if (field == controlPanel.getTurnSpeedField()) field.setText(ControlPanel.DEFAULT_TURN_SPEED);
         else if (field == controlPanel.getFollowDistanceField()) field.setText(ControlPanel.DEFAULT_FOLLOW_DISTANCE);
@@ -749,41 +666,32 @@ public class FtcFieldSimulatorApp extends Application {
 
         boolean pathExistsAndNotEmpty = !currentPath.isEmpty();
         controlPanel.setPointEditingControlsDisabled(!pathExistsAndNotEmpty);
-        controlPanel.enablePathControls(pathExistsAndNotEmpty); // For Delete, Export, Send buttons
+        controlPanel.enablePathControls(pathExistsAndNotEmpty);
 
         Object selectionToRestore = controlPanel.getSelectedPointFromComboBox();
         if (!pathExistsAndNotEmpty) {
-            selectionToRestore = ControlPanel.ALL_POINTS_MARKER; // Show ALL (which will load defaults) if no path
+            selectionToRestore = ControlPanel.ALL_POINTS_MARKER;
         } else {
-            // If current selection is a CurvePoint but no longer in the path (e.g., path was cleared and a new short one made)
             if (selectionToRestore instanceof CurvePoint && !currentPath.contains(selectionToRestore)) {
                 selectionToRestore = ControlPanel.ALL_POINTS_MARKER;
-            } else if (selectionToRestore == null) { // No selection yet, default to ALL if path exists
+            } else if (selectionToRestore == null) {
                 selectionToRestore = ControlPanel.ALL_POINTS_MARKER;
             }
         }
         controlPanel.updatePointSelectionComboBox(currentPath, selectionToRestore);
 
-        // After ComboBox is updated, its value change listener (handlePointSelectionChanged)
-        // should take care of populating the TextFields correctly.
-        // So, explicitly calling refreshParameterFieldsForAllSelected or loadParametersForPoint here
-        // might be redundant if the ComboBox listener is robust.
-        // Let's ensure the listener is triggered or manually trigger if needed.
         Object currentSelectionAfterUpdate = controlPanel.getSelectedPointFromComboBox();
         if (currentSelectionAfterUpdate == null && pathExistsAndNotEmpty) {
-            // This case should ideally not happen if updatePointSelectionComboBox defaults to "ALL"
             controlPanel.updatePointSelectionComboBox(currentPath, ControlPanel.ALL_POINTS_MARKER);
         } else {
-            // Manually refresh based on current combo box state just in case listener didn't cover all edge cases on init
             if (Objects.equals(currentSelectionAfterUpdate, ControlPanel.ALL_POINTS_MARKER)) {
                 refreshParameterFieldsForAllSelected();
             } else if (currentSelectionAfterUpdate instanceof CurvePoint) {
                 controlPanel.loadParametersForPoint((CurvePoint) currentSelectionAfterUpdate);
-            } else { // No path or null selection
+            } else {
                 controlPanel.loadGlobalDefaultsIntoParameterFields();
             }
         }
-        // If path creation is active, disable point editing controls again
         if (isCreatingPath) {
             controlPanel.setPointEditingControlsDisabled(true);
         }
@@ -792,11 +700,9 @@ public class FtcFieldSimulatorApp extends Application {
     private void handleSendPathToRobot() {
         if (currentPath.isEmpty()) {
             instructionLabel.setText("No path to send.");
-            System.out.println("Attempted to send path, but currentPath is empty.");
             return;
         }
 
-        // --- Get the selected IP from the Control Panel ---
         String robotIpAddress = controlPanel.getSelectedIpAddress();
         if (robotIpAddress == null || robotIpAddress.trim().isEmpty()) {
             instructionLabel.setText("No Robot IP Address selected!");
@@ -804,11 +710,8 @@ public class FtcFieldSimulatorApp extends Application {
         }
 
         instructionLabel.setText("Sending path to robot...");
-        System.out.println("Preparing to send " + currentPath.size() + " points to robot at " + robotIpAddress + ":" + ROBOT_LISTENER_PORT);
-        // This try-with-resources block opens the network socket
         try (DatagramSocket socket = new DatagramSocket()) {
             InetAddress address = InetAddress.getByName(robotIpAddress);
-            // --- Get Follow Angle ---
             double followAngle;
             try {
                 followAngle = Double.parseDouble(controlPanel.getFollowAngleField().getText());
@@ -816,14 +719,11 @@ public class FtcFieldSimulatorApp extends Application {
                 byte[] followAngleBuffer = followAngleMessage.getBytes(StandardCharsets.UTF_8);
                 DatagramPacket followAnglePacket = new DatagramPacket(followAngleBuffer, followAngleBuffer.length, address, ROBOT_LISTENER_PORT);
                 socket.send(followAnglePacket);
-                System.out.println("Sent: " + followAngleMessage);
             } catch (NumberFormatException e) {
                 instructionLabel.setText("Invalid Follow Angle! Sending Aborted.");
-                System.err.println("Could not parse Follow Angle. Path sending aborted.");
                 return;
             }
 
-            // --- Get Start Position FROM THE UI TEXT FIELDS ---
             double startX, startY, startHeading;
             try {
                 startX = Double.parseDouble(controlPanel.getStartXField().getText());
@@ -831,17 +731,14 @@ public class FtcFieldSimulatorApp extends Application {
                 startHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
             } catch (NumberFormatException e) {
                 instructionLabel.setText("Invalid Start Position fields! Sending Aborted.");
-                System.err.println("Could not parse Start Position fields. Path sending aborted.");
-                return; // Stop if start position is invalid
+                return;
             }
 
             String startPosMessage = String.format(Locale.US, "start_robot_pos:%.3f,%.3f,%.3f", startX, startY, startHeading);
             byte[] startPosBuffer = startPosMessage.getBytes(StandardCharsets.UTF_8);
             DatagramPacket startPosPacket = new DatagramPacket(startPosBuffer, startPosBuffer.length, address, ROBOT_LISTENER_PORT);
             socket.send(startPosPacket);
-            System.out.println("Sent: " + startPosMessage);
 
-            // Loop through each point in the current path (this part is unchanged)
             for (CurvePoint point : currentPath) {
                 String message = String.format(Locale.US, "curve_point:%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.2f",
                         point.x, point.y, point.moveSpeed, point.turnSpeed,
@@ -851,31 +748,22 @@ public class FtcFieldSimulatorApp extends Application {
                 byte[] buffer = message.getBytes(StandardCharsets.UTF_8);
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, ROBOT_LISTENER_PORT);
                 socket.send(packet);
-                System.out.println("Sent: " + message);
             }
 
-            // Send a final "end" message
             String endMessage = "end";
             byte[] endBuffer = endMessage.getBytes(StandardCharsets.UTF_8);
             DatagramPacket endPacket = new DatagramPacket(endBuffer, endBuffer.length, address, ROBOT_LISTENER_PORT);
             socket.send(endPacket);
-            System.out.println("Sent: " + endMessage);
-            instructionLabel.setText("Path sent successfully to " + robotIpAddress);            System.out.println("Path sending complete.");
+            instructionLabel.setText("Path sent successfully to " + robotIpAddress);
         } catch (IOException e) {
             instructionLabel.setText("Error sending path: " + e.getMessage());
-            System.err.println("Error sending path to robot: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    /**
-     * Handles the logic for exporting the current path to a Java code snippet,
-     * displaying it in a copy-pastable popup window.
-     */
-    private void exportPathToCode() { // The 'ownerStage' parameter is no longer needed
+    private void exportPathToCode() {
         if (currentPath == null || currentPath.isEmpty()) {
             instructionLabel.setText("No path to export.");
-            // Show a simple info alert to the user
             Alert alert = new Alert(Alert.AlertType.INFORMATION);
             alert.setTitle("Export Code");
             alert.setHeaderText(null);
@@ -884,29 +772,28 @@ public class FtcFieldSimulatorApp extends Application {
             return;
         }
 
-        // Use a StringBuilder to efficiently build the code string
         StringBuilder codeBuilder = new StringBuilder();
-
         try {
-            // --- Get configuration values from the UI ---
             double followAngleDeg = Double.parseDouble(controlPanel.getFollowAngleField().getText());
             double startX = Double.parseDouble(controlPanel.getStartXField().getText());
             double startY = Double.parseDouble(controlPanel.getStartYField().getText());
             double startHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
 
-            // --- Generate the Code String ---
-            codeBuilder.append("// Code generated by FTC Field Simulator\n\n");
+            double allianceMultiplier = isRedAlliance ? -1.0 : 1.0;
 
+            codeBuilder.append("// Code generated by FTC Field Simulator\n\n");
             codeBuilder.append("// 1. Set the robot's starting position on the field\n");
-            codeBuilder.append(String.format(Locale.US, "drivetrain.setPosition(new Pose2D(DistanceUnit.INCH, %.2f, %.2f, AngleUnit.DEGREES, %.2f));\n\n", startX, startY, startHeading));
+            double exportStartY = startY * allianceMultiplier;
+            codeBuilder.append(String.format(Locale.US, "drivetrain.setPosition(new Pose2D(DistanceUnit.INCH, %.2f, y(%.2f), AngleUnit.DEGREES, %.2f));\n\n", startX, exportStartY, startHeading));
 
             codeBuilder.append("// 2. Define the path waypoints\n");
             codeBuilder.append("ArrayList<CurvePoint> pathToFollow = new ArrayList<>();\n");
 
             for (CurvePoint point : currentPath) {
+                double exportY = point.y * allianceMultiplier;
                 codeBuilder.append(String.format(Locale.US,
-                        "pathToFollow.add(new CurvePoint(%.2f, %.2f, %.2f, %.2f, %.2f, Math.toRadians(%.1f), %.2f));\n",
-                        point.x, point.y,
+                        "pathToFollow.add(new CurvePoint(%.2f, y(%.2f), %.2f, %.2f, %.2f, Math.toRadians(%.1f), %.2f));\n",
+                        point.x, exportY,
                         point.moveSpeed, point.turnSpeed,
                         point.followDistance,
                         Math.toDegrees(point.slowDownTurnRadians),
@@ -916,7 +803,6 @@ public class FtcFieldSimulatorApp extends Application {
             codeBuilder.append("\n");
 
             codeBuilder.append("// 3. Create and add the command to the scheduler\n");
-            codeBuilder.append("// The 'true' argument enables debug drawing for this path in the simulator.\n");
             codeBuilder.append(String.format(Locale.US, "scheduler.add(new FollowPathCommand(pathToFollow, Math.toRadians(%.1f), true));\n", followAngleDeg));
 
         } catch (NumberFormatException e) {
@@ -924,140 +810,36 @@ public class FtcFieldSimulatorApp extends Application {
             Alert alert = new Alert(Alert.AlertType.ERROR);
             alert.setTitle("Export Error");
             alert.setHeaderText("Invalid Number Format");
-            alert.setContentText("Could not generate code because one of the path parameter fields (like Follow Angle or Start Position) contains invalid text.\n\nError: " + e.getMessage());
+            alert.setContentText("Could not generate code because one of the path parameter fields (like Follow Angle or Start Position) contains invalid text.");
             alert.showAndWait();
             return;
         }
 
-        // --- Create and show the popup window ---
         showCodePopup(codeBuilder.toString());
-        instructionLabel.setText("Code generated. See popup window to copy.");
+        instructionLabel.setText("Code generated with y() wrapping. See popup window to copy.");
     }
 
-    /**
-     * Creates and displays a modal dialog containing the generated Java code.
-     * @param code The string of Java code to display.
-     */
     private void showCodePopup(String code) {
         Alert alert = new Alert(Alert.AlertType.INFORMATION);
         alert.setTitle("Exported Java Code");
-        alert.setHeaderText("Copy the code below and paste it into your OpMode.");
+        alert.setHeaderText("Copy the code below. It uses y() for alliance mirroring.");
         alert.setResizable(true);
 
         TextArea textArea = new TextArea(code);
         textArea.setEditable(false);
-        textArea.setWrapText(false); // Keep formatting clean
-        textArea.setFont(Font.font("Consolas", 14)); // Use a monospace font for code
+        textArea.setWrapText(false);
+        textArea.setFont(Font.font("Consolas", 14));
 
-        // Set preferred size for the TextArea
         textArea.setPrefHeight(400);
         textArea.setPrefWidth(650);
 
-        // To make the dialog resizable with the text area, we put the text area in a layout pane.
-        // This is a common JavaFX trick to make dialog content expandable.
         VBox content = new VBox(textArea);
         VBox.setVgrow(textArea, Priority.ALWAYS);
         alert.getDialogPane().setContent(content);
-
-        // Set the minimum size of the dialog pane itself
         alert.getDialogPane().setPrefSize(650, 480);
 
         alert.showAndWait();
     }
-
-//    /**
-//     * Handles the logic for exporting the current path to a Java code snippet file.
-//     * @param ownerStage The main stage, used as the owner for the file chooser dialog.
-//     */
-//    private void exportPathToCode(Stage ownerStage) {
-//        if (currentPath == null || currentPath.isEmpty()) {
-//            instructionLabel.setText("No path to export.");
-//            return;
-//        }
-//
-//        FileChooser fileChooser = new FileChooser();
-//        fileChooser.setTitle("Export Path to Java Code");
-//        fileChooser.setInitialFileName("MyAutonomousPath.java"); // Suggest a .java file name
-//        fileChooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("Java Files (*.java)", "*.java"));
-//        File file = fileChooser.showSaveDialog(ownerStage);
-//
-//        if (file != null) {
-//            try (PrintWriter writer = new PrintWriter(file)) {
-//                // --- Get configuration values from the UI ---
-//                double followAngleDeg;
-//                try {
-//                    followAngleDeg = Double.parseDouble(controlPanel.getFollowAngleField().getText());
-//                } catch (NumberFormatException e) {
-//                    instructionLabel.setText("Invalid Follow Angle! Using 90 deg for export.");
-//                    followAngleDeg = 90.0; // Fallback to a safe default
-//                }
-//
-//                double startX, startY, startHeading;
-//                try {
-//                    startX = Double.parseDouble(controlPanel.getStartXField().getText());
-//                    startY = Double.parseDouble(controlPanel.getStartYField().getText());
-//                    startHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
-//                } catch (NumberFormatException e) {
-//                    instructionLabel.setText("Invalid Start Position! Using 0,0,0 for export.");
-//                    startX = 0.0;
-//                    startY = 0.0;
-//                    startHeading = 0.0; // Fallback to a safe default
-//                }
-//
-//
-//                // --- START OF MODIFICATIONS ---
-//
-//                // --- 1. Write the scheduler initialization code ---
-//                writer.println("        // It's recommended to initialize the scheduler once in your OpMode's init() method.");
-//                writer.println("        // private CommandScheduler scheduler;");
-//                writer.println("        // public void init() {");
-//                writer.println("        //     ...");
-//                writer.println("        //     scheduler = new CommandScheduler(drivetrain, intake, shooter, turret);");
-//                writer.println("        // }");
-//                writer.println();
-//
-//
-//                // --- 2. Write the initial pose setting code ---
-//                writer.println("        // Set the robot's starting position on the field");
-//                writer.printf(Locale.US, "        Pose2D initialPose = new Pose2D(DistanceUnit.INCH, %.2f, %.2f, AngleUnit.DEGREES, %.2f);\n", startX, startY, startHeading);
-//                writer.println("        drivetrain.setPosition(initialPose);");
-//                writer.println();
-//
-//
-//                // --- 3. Write the path generation code (unchanged) ---
-//                writer.println("        // Path generated by FTC Field Simulator");
-//                writer.println("        boolean debug = true;");
-//                writer.println("        ArrayList<CurvePoint> path = new ArrayList<>();");
-//
-//                for (CurvePoint point : currentPath) {
-//                    writer.printf(Locale.US,
-//                            "        path.add(new CurvePoint(%.2f, %.2f, %.2f, %.2f, %.2f, Math.toRadians(%.1f), %.2f));\n",
-//                            point.x,
-//                            point.y,
-//                            point.moveSpeed,
-//                            point.turnSpeed,
-//                            point.followDistance,
-//                            Math.toDegrees(point.slowDownTurnRadians),
-//                            point.slowDownTurnAmount
-//                    );
-//                }
-//                writer.println();
-//
-//
-//                // --- 4. Write the new scheduler add command ---
-//                writer.printf(Locale.US, "        scheduler.add(new FollowPathCommand(path, Math.toRadians(%.1f), debug));\n", followAngleDeg);
-//
-//                // --- END OF MODIFICATIONS ---
-//
-//                instructionLabel.setText("Path exported as code to " + file.getName());
-//            } catch (Exception e) {
-//                instructionLabel.setText("Error exporting code: " + e.getMessage());
-//                e.printStackTrace();
-//            }
-//        } else {
-//            instructionLabel.setText("Code export cancelled.");
-//        }
-//    }
 
     private void deleteCurrentPath() {
         currentPath.clear();
@@ -1071,42 +853,34 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void finishPathCreation(boolean cancelled) {
-        if (!isCreatingPath) return; // Guard against multiple calls
+        if (!isCreatingPath) return;
+        isCreatingPath = false;
+        fieldDisplay.setPathCreationMode(false, null, null);
 
-        isCreatingPath = false; // Path creation is officially over
-        fieldDisplay.setPathCreationMode(false, null, null); // Stop field listening
-
-        if (cancelled && currentPath != null) { // Null check for currentPath
+        if (cancelled && currentPath != null) {
             currentPath.clear();
             instructionLabel.setText("Path creation cancelled. Click 'New Path' to start again.");
         } else {
-            if (currentPath == null || currentPath.isEmpty()) { // Null check
+            if (currentPath == null || currentPath.isEmpty()) {
                 instructionLabel.setText("Path finished with no points. Click 'New Path' to start again.");
-                if (currentPath != null) currentPath.clear(); // Ensure it's empty if it was just null
-                else currentPath = new ArrayList<>(); // Initialize if null
+                if (currentPath != null) currentPath.clear();
+                else currentPath = new ArrayList<>();
             } else {
                 instructionLabel.setText("Path finished with " + currentPath.size() + " points. Select points to edit parameters.");
             }
         }
 
-        // Explicitly re-enable the "New Path" button and allow others to be controlled by path existence.
         if (controlPanel != null) {
             controlPanel.setPathEditingActive(false);
         }
 
-        // This will now correctly update the state of "Delete", "Export", "Send"
-        // because newPathButton will be seen as enabled by enablePathControls.
-        // It will also update the ComboBox and parameter fields.
         updateControlPanelForPathState();
 
-        // Update the visual path on the field
-        if (fieldDisplay != null && currentPath != null) { // Null checks
+        if (fieldDisplay != null && currentPath != null) {
             fieldDisplay.setPathToDraw(currentPath);
             fieldDisplay.drawCurrentState();
         }
     }
-
-    // In FtcFieldSimulatorApp.java
 
     private void handleFieldClickForPath(Point2D pixelCoords) {
         if (!isCreatingPath || controlPanel == null) return;
@@ -1115,19 +889,16 @@ public class FtcFieldSimulatorApp extends Application {
         double fieldX = inchesCoordsFieldCenter.getX();
         double fieldY = inchesCoordsFieldCenter.getY();
 
-        // If the current path is empty, this is the very first point.
         if (currentPath.isEmpty()) {
-            double startHeading = 0.0; // Default to 0 heading for the first point
+            double startHeading = 0.0;
             robot.setPosition(fieldX, fieldY, startHeading);
-
-            // --- NEW: Update the new UI fields ---
             if (controlPanel != null) {
                 controlPanel.updateRobotStartFields(fieldX, fieldY, startHeading);
             }
-            updateUIFromRobotState(); // This will redraw the robot
+            updateUIFromRobotState();
         }
 
-        double moveSpeed, turnSpeed, followDistance, pointLength, slowDownTurnDeg, slowDownTurnAmount, slowDownTurnRad;
+        double moveSpeed, turnSpeed, followDistance, slowDownTurnDeg, slowDownTurnAmount, slowDownTurnRad;
         try {
             moveSpeed = controlPanel.getMoveSpeedParam();
             turnSpeed = controlPanel.getTurnSpeedParam();
@@ -1139,8 +910,6 @@ public class FtcFieldSimulatorApp extends Application {
             }
             slowDownTurnRad = Math.toRadians(slowDownTurnDeg);
         } catch (NumberFormatException e) {
-            instructionLabel.setText("Invalid global default parameter. Using master defaults for new point.");
-            System.err.println("Error parsing global default parameters: " + e.getMessage() + ". Using master defaults.");
             moveSpeed = MASTER_DEFAULT_MOVE_SPEED;
             turnSpeed = MASTER_DEFAULT_TURN_SPEED;
             followDistance = MASTER_DEFAULT_FOLLOW_DISTANCE;
@@ -1148,15 +917,10 @@ public class FtcFieldSimulatorApp extends Application {
             slowDownTurnAmount = MASTER_DEFAULT_SLOW_DOWN_TURN_AMOUNT;
         }
 
-        CurvePoint newPoint = new CurvePoint(
-                fieldX, // Use the already calculated fieldX
-                fieldY, // Use the already calculated fieldY
-                moveSpeed, turnSpeed, followDistance, slowDownTurnRad, slowDownTurnAmount
-        );
-
+        CurvePoint newPoint = new CurvePoint(fieldX, fieldY, moveSpeed, turnSpeed, followDistance, slowDownTurnRad, slowDownTurnAmount);
         currentPath.add(newPoint);
         fieldDisplay.setPathToDraw(currentPath);
-        fieldDisplay.drawCurrentState(); // This call is sufficient now, as updateUIFromRobotState was called for the first point
+        fieldDisplay.drawCurrentState();
 
         if (currentPath.size() == 1) {
             instructionLabel.setText("Point 1 added. Click next waypoint. ESC to cancel.");
@@ -1167,59 +931,38 @@ public class FtcFieldSimulatorApp extends Application {
 
     private void updateTimeLapsedDisplay() {
         if (controlPanel == null || recordingManager == null) return;
-
-        long timeLapsedMs;
-        if (recordingManager.getCurrentState() == RecordingManager.PlaybackState.RECORDING) {
-            // If recording, show time since recording started
-            timeLapsedMs = recordingManager.getCurrentRecordingDuration(); // Assumes you add such a method to RecordingManager
-            // or calculate it based on System.time - recordingStartTime
-        } else {
-            timeLapsedMs = recordingManager.getCurrentEventTimeLapsed();
-        }
+        long timeLapsedMs = (recordingManager.getCurrentState() == RecordingManager.PlaybackState.RECORDING) ? recordingManager.getCurrentRecordingDuration() : recordingManager.getCurrentEventTimeLapsed();
         controlPanel.updateTimeLapsed(timeLapsedMs);
     }
 
     private void startNewPathCreation() {
-        if (isCreatingPath) return; // Already in this mode
-
-        if (currentPath == null) { // Defensive initialization
-            currentPath = new ArrayList<>();
-        }
+        if (isCreatingPath) return;
+        if (currentPath == null) currentPath = new ArrayList<>();
         currentPath.clear();
         isCreatingPath = true;
         fieldDisplay.setHighlightedPoint(null);
 
-        // Mode change: Disable "New Path", "Delete", "Export", "Send"
-        // and enable "Finish Path" / "Cancel Path" implicitly by UI context.
         if (controlPanel != null) {
             controlPanel.setPathEditingActive(true);
         }
 
-        // Update other UI elements:
-        // - ComboBox for points should be cleared/disabled.
-        // - Parameter fields should show global defaults but be disabled.
-        // - "Delete", "Export", "Send" will be further confirmed as disabled by enablePathControls(false)
         updateControlPanelForPathState();
-
         instructionLabel.setText("Click the first waypoint. Parameters from global defaults will be used.");
         if (fieldDisplay != null) {
             fieldDisplay.setPathCreationMode(true, this::handleFieldClickForPath, () -> finishPathCreation(false));
-            fieldDisplay.setPathToDraw(currentPath); // Show path as it's built
+            fieldDisplay.setPathToDraw(currentPath);
             fieldDisplay.drawCurrentState();
         }
     }
 
-    // --- Recording, UDP, and Other Utility Methods (ensure these are complete from your original) ---
     private void setupRecordingControlActions() {
         controlPanel.setOnOpenAction(e -> handleOpenRecording());
         controlPanel.setOnSaveAction(e -> handleSaveRecording());
         controlPanel.setOnClearRecordingAction(e -> {
             if (recordingManager != null) {
                 recordingManager.clearAll();
-
-                // Update UI to reflect the cleared state
                 controlPanel.setPlaybackControlsDisabled(true);
-                controlPanel.updateTimelineSlider(0, 1); // Reset slider
+                controlPanel.updateTimelineSlider(0, 1);
                 controlPanel.setSaveButtonDisabled(true);
                 updateTimeLapsedDisplay();
                 instructionLabel.setText("Recording and replay buffer cleared.");
@@ -1284,53 +1027,30 @@ public class FtcFieldSimulatorApp extends Application {
         controlPanel.setOnSliderMouseReleased(event -> {
             if (recordingManager.getCurrentState() != RecordingManager.PlaybackState.PLAYING &&
                     recordingManager.getCurrentState() != RecordingManager.PlaybackState.RECORDING) {
-
                 int sliderRawValue = (int) controlPanel.getTimelineSlider().getValue();
-
-                // The FieldDisplay might need to be cleared before a potentially large jump
-                // if (fieldDisplay != null) {
-                // fieldDisplay.clearDrawingSurface(); // Or similar method
-                // }
-
-                recordingManager.seekTo(sliderRawValue); // seekTo will now handle snapping and dispatching
-
-                // After seekTo, playbackIndex in RecordingManager is at the snapped position.
-                // The dispatchCurrentEvent calls within seekTo would have updated the
-                // onProgressUpdateCallback, which in turn should update the slider's visual position
-                // to the new playbackIndex and the time label.
-                // So, an explicit controlPanel.getTimelineSlider().setValue() here might cause a flicker
-                // if onProgressUpdate also does it. Let onProgressUpdate be the source of truth for UI sync.
-
-                controlPanel.togglePlayPauseButtonIcon(false); // Ensure UI consistency
+                recordingManager.seekTo(sliderRawValue);
+                controlPanel.togglePlayPauseButtonIcon(false);
             }
-            // updateTimeLapsedDisplay(); // Should be handled by onProgressUpdate from seekTo
         });
 
         controlPanel.setOnInstantReplayAction(e -> {
             recordingManager.loadFromLiveBuffer();
-            controlPanel.setReplayMode(true); // Switch UI to replay mode
-
-            boolean hasRecording = recordingManager.hasRecording();
-
-            // Update UI state based on whether the buffer had events
-            if (hasRecording) {
-                // Set slider max to the number of events and seek to the beginning
+            controlPanel.setReplayMode(true);
+            if (recordingManager.hasRecording()) {
                 controlPanel.updateTimelineSlider(0, recordingManager.getTotalEvents());
                 recordingManager.seekTo(0);
                 instructionLabel.setText("Reviewing last 10 minutes. Use timeline to scrub.");
             } else {
-                controlPanel.updateTimelineSlider(0, 1); // Reset slider
+                controlPanel.updateTimelineSlider(0, 1);
                 instructionLabel.setText("Live buffer is empty. No replay available.");
             }
             updateTimeLapsedDisplay();
         });
 
         controlPanel.setOnReturnToLiveAction(e -> {
-            recordingManager.stopPlayback(); // Ensure any playback is stopped
-            recordingManager.loadRecording(new ArrayList<>()); // Clear the main session
-            controlPanel.setReplayMode(false); // Switch UI back to live mode
-
-            // Reset UI elements to a clean live state
+            recordingManager.stopPlayback();
+            recordingManager.loadRecording(new ArrayList<>());
+            controlPanel.setReplayMode(false);
             fieldDisplay.clearTrail();
             clearAllNamedLines();
             fieldDisplay.drawCurrentState();
@@ -1369,11 +1089,7 @@ public class FtcFieldSimulatorApp extends Application {
         else if (data instanceof CircleData) { CircleData d = (CircleData) data; payload = String.format(Locale.US,"cir:%.3f,%.3f", d.radiusInches, d.heading); }
         else if (data instanceof LineData) { LineData d = (LineData) data; payload = String.format(Locale.US,"line:%s,%.3f,%.3f,%.3f,%.3f,%d", d.name, d.x1, d.y1, d.x2, d.y2, d.styleCode); }
         else if (data instanceof TextData) { TextData d = (TextData) data; payload = "txt:" + d.text; }
-        else if (data instanceof KeyValueData) {
-            KeyValueData kv = (KeyValueData) data;
-            // Simple escaping for now to handle potential issues in the value string
-            payload = String.format("kv:%s,%s", kv.key, kv.value);
-        }
+        else if (data instanceof KeyValueData) { KeyValueData kv = (KeyValueData) data; payload = String.format("kv:%s,%s", kv.key, kv.value); }
         else { return null; }
         return event.timestamp + "|" + payload;
     }
@@ -1396,11 +1112,7 @@ public class FtcFieldSimulatorApp extends Application {
                 else if (payload.startsWith("cir:")) { String c = payload.substring(4); String[] p = c.split(","); if (p.length == 2) parsedData = new CircleData(Double.parseDouble(p[0]), Double.parseDouble(p[1])); }
                 else if (payload.startsWith("line:")) { String c = payload.substring(5); String[] p = c.split(",", 6); if (p.length == 6) parsedData = new LineData(p[0], Double.parseDouble(p[1]), Double.parseDouble(p[2]), Double.parseDouble(p[3]), Double.parseDouble(p[4]), Integer.parseInt(p[5]));}
                 else if (payload.startsWith("txt:")) { parsedData = new TextData(payload.substring(4));}
-                else if (payload.startsWith("kv:")) {
-                    String c = payload.substring(3);
-                    String[] p = c.split(",", 2);
-                    if (p.length == 2) parsedData = new KeyValueData(p[0], p[1]);
-                }
+                else if (payload.startsWith("kv:")) { String c = payload.substring(3); String[] p = c.split(",", 2); if (p.length == 2) parsedData = new KeyValueData(p[0], p[1]); }
                 if (parsedData != null) loadedEvents.add(new RecordingManager.RecordedEvent(timestamp, parsedData));
             }
             recordingManager.loadRecording(loadedEvents);
@@ -1416,40 +1128,20 @@ public class FtcFieldSimulatorApp extends Application {
         }
     }
 
-    /**
-     * This method is called directly by the UDP listener thread.
-     * Its only jobs are to add the event to the appropriate buffers and
-     * then, if in a live mode, pass the data to the UI thread for processing.
-     * It should NOT do any UI updates itself.
-     */
     private void handleUdpMessage(UdpMessageData messageData) {
         if (messageData == null) return;
-
-        // 1. Always add the event to the live buffer for instant replay functionality.
         recordingManager.addLiveEvent(messageData);
-
-        // 2. If a formal recording session is active, also add the event to that session.
         if (recordingManager.getCurrentState() == RecordingManager.PlaybackState.RECORDING) {
             recordingManager.addEvent(messageData);
         }
-
-        // 3. If we are in a "live" viewing mode (not playing back or paused),
-        //    then schedule the UI update to run on the main JavaFX thread.
         RecordingManager.PlaybackState state = recordingManager.getCurrentState();
         if (state != RecordingManager.PlaybackState.PLAYING && state != RecordingManager.PlaybackState.PAUSED) {
             Platform.runLater(() -> processUdpDataAndUpdateUI(messageData));
         }
     }
 
-    /**
-     * This method is ONLY called from the JavaFX Application Thread (via Platform.runLater).
-     * It is responsible for taking message data and updating all relevant UI components,
-     * such as the robot's position, the field trail, and text displays.
-     */
     private void processUdpDataAndUpdateUI(UdpMessageData messageData) {
         if (messageData == null) return;
-
-        // Process the data based on its type
         if (messageData instanceof PositionData) {
             PositionData p = (PositionData) messageData;
             if (robot != null) {
@@ -1477,35 +1169,12 @@ public class FtcFieldSimulatorApp extends Application {
                 keyValueTable.updateValue(kv.key, kv.value);
             }
         }
-
-        // After processing, redraw the UI
         if (messageData instanceof PositionData) {
-            // This also updates status text fields and redraws the field
             updateUIFromRobotState();
         } else {
-            // For non-positional data, just redraw the field to show new lines, circles, etc.
             fieldDisplay.drawCurrentState();
         }
     }
-
-
-//    private void handleUdpMessage(UdpMessageData messageData) {
-//        if (messageData == null) return;
-//        Platform.runLater(() -> {
-//            if (recordingManager.getCurrentState() == RecordingManager.PlaybackState.RECORDING) recordingManager.addEvent(messageData);
-//            if (messageData instanceof PositionData) { PositionData p = (PositionData)messageData; if(robot!=null){ fieldDisplay.addTrailDot(robot.getXInches(),robot.getYInches()); robot.setPosition(p.x,p.y); robot.setHeading(p.heading);}}
-//            else if (messageData instanceof CircleData) { CircleData c = (CircleData)messageData; if(fieldDisplay!=null) fieldDisplay.addDebugCircle(robot.getXInches(),robot.getYInches(),c.radiusInches,c.heading,Color.rgb(255,165,0,0.7));}
-//            else if (messageData instanceof LineData) { LineData l = (LineData)messageData; synchronized(namedLinesLock){namedLinesToDraw.put(l.name,l);}}
-//            else if (messageData instanceof TextData) { TextData t = (TextData)messageData; if(fieldDisplay!=null) fieldDisplay.setRobotTextMessage(t.text);}
-//            else if (messageData instanceof KeyValueData) {
-//                KeyValueData kv = (KeyValueData) messageData;
-//                if (keyValueTable != null) {
-//                    keyValueTable.updateValue(kv.key, kv.value);
-//                }
-//            }
-//            if(messageData instanceof PositionData) updateUIFromRobotState(); else fieldDisplay.drawCurrentState();
-//        });
-//    }
 
     private void onPlaybackFinished() {
         Platform.runLater(() -> {
@@ -1522,26 +1191,18 @@ public class FtcFieldSimulatorApp extends Application {
             udpListenerThread = new Thread(udpListener, "UdpListenerThread");
             udpListenerThread.setDaemon(true);
             udpListenerThread.start();
-            System.out.println("UDP Listener started on port " + UDP_LISTENER_PORT);
         } catch (Exception e) {
-            instructionLabel.setText("ERROR: UDP Listener start failed on " + UDP_LISTENER_PORT);
             e.printStackTrace();
         }
     }
 
     private void startUdpPlotListener() {
         try {
-            udpPlotListener = new UdpPlotListener(this::handleUdpPlotData); // Uses default port from UdpPlotListener
+            udpPlotListener = new UdpPlotListener(this::handleUdpPlotData);
             udpPlotListenerThread = new Thread(udpPlotListener, "UdpPlotListenerThread");
             udpPlotListenerThread.setDaemon(true);
             udpPlotListenerThread.start();
-            System.out.println("UDP Plot Listener started on port " + UdpPlotListener.DEFAULT_PLOT_LISTENER_PORT);
         } catch (Exception e) {
-            // You might want a different label or way to show this error if instructionLabel is for field sim
-            System.err.println("ERROR: UDP Plot Listener start failed on " + UdpPlotListener.DEFAULT_PLOT_LISTENER_PORT + " - " + e.getMessage());
-            if (instructionLabel != null) { // Be cautious if this runs before instructionLabel is ready
-                instructionLabel.setText("ERROR: Plot Listener failed");
-            }
             e.printStackTrace();
         }
     }
@@ -1549,25 +1210,15 @@ public class FtcFieldSimulatorApp extends Application {
     private void stopApp() {
         if (udpListener != null) udpListener.stopListener();
         if (udpPlotListener != null) udpPlotListener.stopListener();
-
         if (udpListenerThread != null && udpListenerThread.isAlive()) {
-            try {
-                udpListenerThread.join(500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            try { udpListenerThread.join(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
         if (udpPlotListenerThread != null && udpPlotListenerThread.isAlive()) {
-            try {
-                udpPlotListenerThread.join(500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            try { udpPlotListenerThread.join(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
-        if (plotDisplayWindow != null && plotDisplayWindow.isShowing()){ // Close plot window if open
+        if (plotDisplayWindow != null && plotDisplayWindow.isShowing()){
             plotDisplayWindow.hide();
         }
-        System.out.println("Exiting application.");
         Platform.exit();
         System.exit(0);
     }
@@ -1584,7 +1235,7 @@ public class FtcFieldSimulatorApp extends Application {
     private void handleSceneKeyPress(KeyEvent event) {
         if (isCreatingPath) {
             if (event.getCode() == KeyCode.ESCAPE) {
-                finishPathCreation(true); // true for cancelled
+                finishPathCreation(true);
                 event.consume();
             }
         } else {
@@ -1593,18 +1244,14 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void handleRobotMovementKeyPress(KeyEvent event) {
-        if (robot == null || isCreatingPath) { // Do not move robot if path creation is active
-            return;
-        }
+        if (robot == null || isCreatingPath) return;
         double currentX = robot.getXInches();
         double currentY = robot.getYInches();
         double currentHeading_CCW = robot.getHeadingDegrees();
         boolean moved = false;
-
         double newFieldX = currentX;
         double newFieldY = currentY;
         double angleRad_CCW = Math.toRadians(currentHeading_CCW);
-
         switch (event.getCode()) {
             case UP:
                 newFieldX = currentX + ROBOT_MOVE_INCREMENT_INCHES * Math.cos(angleRad_CCW);
@@ -1624,23 +1271,20 @@ public class FtcFieldSimulatorApp extends Application {
                 robot.setHeading(currentHeading_CCW - ROBOT_TURN_INCREMENT_DEGREES);
                 moved = true;
                 break;
-            case A: // Strafe Left
+            case A:
                 double strafeLeftAngleRad_CCW = Math.toRadians(currentHeading_CCW + 90.0);
                 newFieldX = currentX + ROBOT_MOVE_INCREMENT_INCHES * Math.cos(strafeLeftAngleRad_CCW);
                 newFieldY = currentY + ROBOT_MOVE_INCREMENT_INCHES * Math.sin(strafeLeftAngleRad_CCW);
                 moved = true;
                 break;
-            case D: // Strafe Right
+            case D:
                 double strafeRightAngleRad_CCW = Math.toRadians(currentHeading_CCW - 90.0);
                 newFieldX = currentX + ROBOT_MOVE_INCREMENT_INCHES * Math.cos(strafeRightAngleRad_CCW);
                 newFieldY = currentY + ROBOT_MOVE_INCREMENT_INCHES * Math.sin(strafeRightAngleRad_CCW);
                 moved = true;
                 break;
-            default:
-                // Not a movement key we handle here
-                break;
+            default: break;
         }
-
         if (moved) {
             if (event.getCode() == KeyCode.UP || event.getCode() == KeyCode.DOWN ||
                     event.getCode() == KeyCode.A || event.getCode() == KeyCode.D) {
@@ -1652,8 +1296,7 @@ public class FtcFieldSimulatorApp extends Application {
                 controlPanel.updateRobotStartFields(robot.getXInches(), robot.getYInches(), displayHeading);
             }
             updateUIFromRobotState();
-            event.consume(); // Consume the event so it's not processed further (e.g., by focus traversal)
+            event.consume();
         }
     }
 }
-
