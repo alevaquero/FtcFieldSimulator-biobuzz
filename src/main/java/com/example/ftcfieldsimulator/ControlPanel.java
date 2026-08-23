@@ -1,5 +1,8 @@
 package com.example.ftcfieldsimulator;
 
+import javafx.animation.KeyFrame;
+import javafx.animation.Timeline;
+import javafx.application.Platform;
 import javafx.beans.value.ChangeListener;
 import javafx.collections.FXCollections;
 import javafx.event.ActionEvent;
@@ -15,10 +18,14 @@ import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
+import javafx.scene.paint.Color;
+import javafx.scene.shape.Circle;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
 import javafx.util.Callback;
+import javafx.util.Duration;
 
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -31,8 +38,13 @@ public class ControlPanel extends VBox {
 
     // --- UI Elements ---
     private Button newPathButton, deletePathButton, importCodeButton, exportCodeButton, clearTrailButton, clearNamedLinesButton;
+    private Button editMissionButton; // New button for mission script popup
+    private ComboBox<PathData> pathSelectionComboBox; // Multi-path support
+    private TextArea missionScriptArea; // Mission Script Support (stored here, edited in popup)
     private ComboBox<String> ipAddressComboBox;
-    private Button sendPathButton;
+    private Button sendMissionButton;
+    private Circle connectivityLed;
+    private Timeline pingTimeline;
     private Button recordButton, playPauseButton, reverseButton, forwardButton;
     private Button instantReplayButton, returnToLiveButton;
     private Button openButton, saveButton, clearButton;
@@ -76,26 +88,35 @@ public class ControlPanel extends VBox {
         // --- SPACING CHANGE 2: Reduced title font size from 16 to 15 ---
         Font titleFont = Font.font("Arial", FontWeight.BOLD, 15);
 
-        // --- Path Management Section ---
-        Label pathTitle = new Label("Path Management");
-        pathTitle.setFont(titleFont);
+        // --- Robot Management Section ---
+        Label robotTitle = new Label("Robot Management");
+        robotTitle.setFont(titleFont);
+
+        connectivityLed = new Circle(6, Color.RED);
+        HBox robotTitleBox = new HBox(10, robotTitle, connectivityLed);
+        robotTitleBox.setAlignment(Pos.CENTER_LEFT);
+
+        pathSelectionComboBox = new ComboBox<>();
+        pathSelectionComboBox.setPromptText("Select Path");
+        pathSelectionComboBox.setMaxWidth(Double.MAX_VALUE);
 
         newPathButton = createMaxWidthButton("New Path");
         deletePathButton = createMaxWidthButton("Delete Path");
-        importCodeButton = createMaxWidthButton("Import Code");
-        exportCodeButton = createMaxWidthButton("Export Code");
+        importCodeButton = createMaxWidthButton("Import Mission");
+        exportCodeButton = createMaxWidthButton("Export Mission");
         ipAddressComboBox = new ComboBox<>();
         ipAddressComboBox.getItems().addAll("192.168.43.1", "192.168.56.2");
         ipAddressComboBox.setValue("192.168.43.1"); // Set default value
         ipAddressComboBox.setTooltip(new Tooltip("Select the Robot IP Address"));
         ipAddressComboBox.setStyle("-fx-font-size: 12px;");
-        sendPathButton = createMaxWidthButton("Send Path to Robot");
-        sendPathButton.setStyle("-fx-font-size: 12px;");
+        ipAddressComboBox.valueProperty().addListener((obs, oldVal, newVal) -> triggerImmediatePing());
+        sendMissionButton = createMaxWidthButton("Send Mission to Robot");
+        sendMissionButton.setStyle("-fx-font-size: 12px;");
 
         // Create an HBox to hold the IP selector and the send button
-        HBox sendPathBox = new HBox(10, ipAddressComboBox, sendPathButton);
+        HBox sendPathBox = new HBox(10, ipAddressComboBox, sendMissionButton);
         sendPathBox.setAlignment(Pos.CENTER_LEFT);
-        HBox.setHgrow(sendPathButton, Priority.ALWAYS); // Make the button fill remaining space
+        HBox.setHgrow(sendMissionButton, Priority.ALWAYS); // Make the button fill remaining space
 
         // Create an HBox for the new/delete buttons
         HBox newDeleteBox = new HBox(5, newPathButton, deletePathButton);
@@ -107,7 +128,13 @@ public class ControlPanel extends VBox {
         HBox.setHgrow(importCodeButton, Priority.ALWAYS);
         HBox.setHgrow(exportCodeButton, Priority.ALWAYS);
 
-        VBox pathControlsBox = new VBox(SECTION_SPACING, pathTitle, newDeleteBox, importExportBox, sendPathBox);
+        VBox pathControlsBox = new VBox(SECTION_SPACING, robotTitleBox, pathSelectionComboBox, newDeleteBox, importExportBox, sendPathBox);
+
+        // --- Mission Script Section ---
+        editMissionButton = createMaxWidthButton("Edit Mission Script");
+        missionScriptArea = new TextArea(); // Stored but not added to layout
+        missionScriptArea.setFont(Font.font("Consolas", 12));
+        missionScriptArea.setPromptText("# Mission Script\nINIT: x=0 | y=0 | heading=0 | alliance=BLUE | delay=0\n...");
 
 
         // --- Robot Start Position Section ---
@@ -226,7 +253,33 @@ public class ControlPanel extends VBox {
         setPointEditingControlsDisabled(true);
         loadGlobalDefaultsIntoParameterFields();
 
-        this.getChildren().addAll(pathControlsBox, robotStartBox, curveParamsBox, utilityControlsBox, recordingControlsBox, toolsControlsBox);
+        this.getChildren().addAll(robotStartBox, pathControlsBox, editMissionButton, curveParamsBox, utilityControlsBox, recordingControlsBox, toolsControlsBox);
+
+        startPingService();
+    }
+
+    private void triggerImmediatePing() {
+        String ip = getSelectedIpAddress();
+        if (ip != null && !ip.isEmpty()) {
+            new Thread(() -> {
+                boolean reachable = false;
+                try {
+                    reachable = InetAddress.getByName(ip).isReachable(1000);
+                } catch (Exception ignored) {}
+                boolean finalReachable = reachable;
+                Platform.runLater(() -> {
+                    connectivityLed.setFill(finalReachable ? Color.GREEN : Color.RED);
+                });
+            }).start();
+        } else {
+            connectivityLed.setFill(Color.GRAY);
+        }
+    }
+
+    private void startPingService() {
+        pingTimeline = new Timeline(new KeyFrame(Duration.seconds(2), event -> triggerImmediatePing()));
+        pingTimeline.setCycleCount(Timeline.INDEFINITE);
+        pingTimeline.play();
     }
 
     private GridPane createParametersGrid(double vgap) {
@@ -368,7 +421,8 @@ public class ControlPanel extends VBox {
     public void setOnNewPathAction(EventHandler<ActionEvent> handler) { newPathButton.setOnAction(handler); }
     public void setOnDeletePathAction(EventHandler<ActionEvent> handler) { deletePathButton.setOnAction(handler); }
     public void setOnImportCodeAction(EventHandler<ActionEvent> handler) { importCodeButton.setOnAction(handler); }    public void setOnExportCodeAction(EventHandler<ActionEvent> handler) { exportCodeButton.setOnAction(handler); }
-    public void setOnSendPathAction(EventHandler<ActionEvent> handler) { if (sendPathButton != null) { sendPathButton.setOnAction(handler); } }
+    public void setOnEditMissionAction(EventHandler<ActionEvent> handler) { editMissionButton.setOnAction(handler); }
+    public void setOnSendMissionAction(EventHandler<ActionEvent> handler) { if (sendMissionButton != null) { sendMissionButton.setOnAction(handler); } }
     public void setOnClearTrailAction(EventHandler<ActionEvent> handler) { clearTrailButton.setOnAction(handler); }
     public void setOnClearNamedLinesAction(EventHandler<ActionEvent> handler) { clearNamedLinesButton.setOnAction(handler); }
 
@@ -395,8 +449,8 @@ public class ControlPanel extends VBox {
         deletePathButton.setDisable(isActive || deletePathButton.isDisabled());
         importCodeButton.setDisable(isActive); // Disable during path creation
         exportCodeButton.setDisable(isActive || exportCodeButton.isDisabled());
-        if (sendPathButton != null) {
-            sendPathButton.setDisable(isActive || sendPathButton.isDisabled());
+        if (sendMissionButton != null) {
+            sendMissionButton.setDisable(isActive || sendMissionButton.isDisabled());
             ipAddressComboBox.setDisable(isActive || ipAddressComboBox.isDisabled()); // Also disable the IP box
         }
     }
@@ -420,8 +474,8 @@ public class ControlPanel extends VBox {
         deletePathButton.setDisable(!pathExists || pathEditingMode);
         importCodeButton.setDisable(pathEditingMode);
         exportCodeButton.setDisable(!pathExists || pathEditingMode);
-        if (sendPathButton != null) {
-            sendPathButton.setDisable(!pathExists || pathEditingMode);
+        if (sendMissionButton != null) {
+            sendMissionButton.setDisable(!pathExists || pathEditingMode);
             ipAddressComboBox.setDisable(!pathExists || pathEditingMode); // Also disable the IP box if no path
         }
     }
@@ -451,11 +505,23 @@ public class ControlPanel extends VBox {
 
     public Slider getTimelineSlider() { return this.timelineSlider; }
     public ComboBox<Object> getPointSelectionComboBox() { return pointSelectionComboBox; }
+    public ComboBox<PathData> getPathSelectionComboBox() { return pathSelectionComboBox; }
 
     public void setPointEditingControlsDisabled(boolean disabled) {
         pointSelectionComboBox.setDisable(disabled);
         for (TextField tf : paramTextFieldsList) {
             tf.setDisable(disabled);
+        }
+    }
+
+    public String getMissionScript() { return missionScriptArea.getText(); }
+    public void setMissionScript(String script) { missionScriptArea.setText(script); }
+    public TextArea getMissionScriptArea() { return missionScriptArea; }
+
+    public void updatePathSelectionComboBox(List<PathData> paths, PathData pathToSelect) {
+        pathSelectionComboBox.setItems(FXCollections.observableArrayList(paths));
+        if (pathToSelect != null) {
+            pathSelectionComboBox.setValue(pathToSelect);
         }
     }
 
@@ -484,6 +550,10 @@ public class ControlPanel extends VBox {
 
     public void setOnPointSelectionAction(ChangeListener<Object> listener) {
         pointSelectionComboBox.valueProperty().addListener(listener);
+    }
+
+    public void setOnPathSelectionAction(ChangeListener<PathData> listener) {
+        pathSelectionComboBox.valueProperty().addListener(listener);
     }
 
     public Object getSelectedPointFromComboBox() {

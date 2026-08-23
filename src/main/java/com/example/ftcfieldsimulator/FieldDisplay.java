@@ -93,6 +93,10 @@ public class FieldDisplay extends Pane {
     private Map<String, UdpPositionListener.LineData> namedLinesMap = new HashMap<>();
     private final Object namedLinesMapLock = new Object();
 
+    // allPathsToDraw stores all the paths created
+    private List<PathData> allPathsToDraw = new ArrayList<>();
+    // activePath points to the path currently being edited
+    private PathData activePath = null;
     // currentPathToDraw stores points as (FieldX, FieldY) based on the new system
     private List<CurvePoint> currentPathToDraw = new ArrayList<>();
     private Consumer<Point2D> onFieldPointClickListener;
@@ -609,8 +613,14 @@ public class FieldDisplay extends Pane {
         gc.restore(); // Restore previous state
     }
 
+    public void setPathsToDraw(List<PathData> paths, PathData activePath) {
+        this.allPathsToDraw = (paths != null) ? paths : new ArrayList<>();
+        this.activePath = activePath;
+        this.currentPathToDraw = (activePath != null) ? activePath.points : new ArrayList<>();
+    }
+
     public void setPathToDraw(List<CurvePoint> path) { // Path points are (FieldX, FieldY)
-        this.currentPathToDraw = (path != null) ? new ArrayList<>(path) : new ArrayList<>();
+        this.currentPathToDraw = (path != null) ? (path instanceof ArrayList ? (List<CurvePoint>)path : new ArrayList<>(path)) : new ArrayList<>();
     }
 
 //    public void setPathToDraw(List<Position> path) { // Path points are (FieldX, FieldY)
@@ -632,7 +642,9 @@ public class FieldDisplay extends Pane {
         this.onFieldPointClickListener = pointClickListener;
         this.onPathFinishListener = pathFinishListener;
         canvas.setCursor(isActive ? Cursor.CROSSHAIR : Cursor.DEFAULT);
-        if (!isActive) {
+        if (isActive) {
+            canvas.requestFocus();
+        } else {
             coordinateLabel.setVisible(false);
         }
     }
@@ -706,51 +718,78 @@ public class FieldDisplay extends Pane {
             }
         }
 
-        // 5. Draw the main path and waypoints on top of the trail and robot
-        if (currentPathToDraw != null && !currentPathToDraw.isEmpty()) {
-            gc.setStroke(isPathCreationMode ? Color.CYAN : Color.MAGENTA);
-            gc.setLineWidth(2);
-            if (currentPathToDraw.size() > 1) {
-                for (int i = 0; i < currentPathToDraw.size() - 1; i++) {
-                    // Highlight the hovered segment
-                    if (i == hoveredSegmentIndex) {
-                        gc.setStroke(Color.ORANGE);
-                        gc.setLineWidth(4);
-                    } else {
-                        gc.setStroke(isPathCreationMode ? Color.CYAN : Color.MAGENTA);
-                        gc.setLineWidth(2);
+        // 5. Draw all paths
+        if (allPathsToDraw != null) {
+            for (PathData pathData : allPathsToDraw) {
+                boolean isActive = (pathData == activePath);
+                List<CurvePoint> points = pathData.points;
+                if (points == null || points.isEmpty()) continue;
+
+                if (isActive) {
+                    gc.setStroke(isPathCreationMode ? Color.CYAN : Color.MAGENTA);
+                    gc.setLineWidth(3);
+                } else {
+                    gc.setStroke(Color.GRAY.deriveColor(0, 1, 1, 0.4));
+                    gc.setLineWidth(1.5);
+                }
+
+                if (points.size() > 1) {
+                    for (int i = 0; i < points.size() - 1; i++) {
+                        if (isActive) {
+                            // Highlight the hovered segment
+                            if (i == hoveredSegmentIndex) {
+                                gc.setStroke(Color.ORANGE);
+                                gc.setLineWidth(5);
+                            } else {
+                                gc.setStroke(isPathCreationMode ? Color.CYAN : Color.MAGENTA);
+                                gc.setLineWidth(3);
+                            }
+                        } else {
+                            // Inactive paths drawn as thin gray lines
+                            gc.setStroke(Color.GRAY.deriveColor(0, 1, 1, 0.5));
+                            gc.setLineWidth(1.5);
+                        }
+
+                        CurvePoint p1 = points.get(i);
+                        CurvePoint p2 = points.get(i + 1);
+                        gc.strokeLine(fieldYtoCanvasX(p1.y), fieldXtoCanvasY(p1.x),
+                                fieldYtoCanvasX(p2.y), fieldXtoCanvasY(p2.x));
                     }
-
-                    CurvePoint p1 = currentPathToDraw.get(i);
-                    CurvePoint p2 = currentPathToDraw.get(i + 1);
-                    gc.strokeLine(fieldYtoCanvasX(p1.y), fieldXtoCanvasY(p1.x),
-                            fieldYtoCanvasX(p2.y), fieldXtoCanvasY(p2.x));
-                }
-            }
-            // Reset stroke for drawing waypoints
-            gc.setStroke(Color.BLACK);
-            gc.setLineWidth(1);
-
-            // Draw waypoints with hover/drag effects
-            for (CurvePoint p : currentPathToDraw) {
-                double canvasX = fieldYtoCanvasX(p.y);
-                double canvasY = fieldXtoCanvasY(p.x);
-                double pointSize = 8.0;
-                Color pointColor = Color.RED;
-
-                if (p == draggedPoint) {
-                    pointSize = 12.0;
-                    pointColor = Color.DODGERBLUE;
-                } else if (p == hoveredPoint) {
-                    pointSize = 12.0;
-                    pointColor = Color.GOLD;
-                } else if (p == highlightedPoint) {
-                    pointSize = 12.0;
-                    pointColor = Color.YELLOW;
                 }
 
-                gc.setFill(pointColor);
-                gc.fillOval(canvasX - pointSize / 2, canvasY - pointSize / 2, pointSize, pointSize);
+                // Draw waypoints for the active path
+                if (isActive) {
+                    gc.setStroke(Color.BLACK);
+                    gc.setLineWidth(1);
+                    for (CurvePoint p : points) {
+                        double canvasX = fieldYtoCanvasX(p.y);
+                        double canvasY = fieldXtoCanvasY(p.x);
+                        double pointSize = 8.0;
+                        Color pointColor = Color.RED;
+
+                        if (p == draggedPoint) {
+                            pointSize = 12.0;
+                            pointColor = Color.DODGERBLUE;
+                        } else if (p == hoveredPoint) {
+                            pointSize = 12.0;
+                            pointColor = Color.GOLD;
+                        } else if (p == highlightedPoint) {
+                            pointSize = 12.0;
+                            pointColor = Color.YELLOW;
+                        }
+
+                        gc.setFill(pointColor);
+                        gc.fillOval(canvasX - pointSize / 2, canvasY - pointSize / 2, pointSize, pointSize);
+                    }
+                } else {
+                    // Small dots for inactive paths
+                    gc.setFill(Color.GRAY.deriveColor(0, 1, 1, 0.6));
+                    for (CurvePoint p : points) {
+                        double canvasX = fieldYtoCanvasX(p.y);
+                        double canvasY = fieldXtoCanvasY(p.x);
+                        gc.fillOval(canvasX - 2.5, canvasY - 2.5, 5, 5);
+                    }
+                }
             }
         }
 

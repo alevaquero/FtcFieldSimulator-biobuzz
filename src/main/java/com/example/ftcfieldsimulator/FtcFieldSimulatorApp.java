@@ -50,6 +50,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -76,12 +77,17 @@ public class FtcFieldSimulatorApp extends Application {
     private PlotDisplayWindow plotDisplayWindow;
     private UdpPlotListener udpPlotListener;
     private Thread udpPlotListenerThread;
-    private List<CurvePoint> currentPath = new ArrayList<>();
+    private List<PathData> allPaths = new ArrayList<>();
+    private List<AutonomousStep> missionSteps = new ArrayList<>(); // Sequential mission steps
+    private PathData selectedPath = null;
     private boolean isCreatingPath = false;
+    private boolean isUpdatingFromScript = false; // Flag to prevent recursion
     private Map<String, LineData> namedLinesToDraw = new HashMap<>();
     private final Object namedLinesLock = new Object();
     private Map<TextField, String> textFieldPreviousValues = new HashMap<>();
     private boolean isRedAlliance = false; // State to track current alliance view
+    private Stage missionEditorStage = null;
+    private TextArea popupScriptArea = null;
 
     // --- Configuration Constants ---
     public static final double FIELD_WIDTH_INCHES = 144.0;
@@ -169,6 +175,7 @@ public class FtcFieldSimulatorApp extends Application {
         setupParameterFieldListeners();
         setupFieldDisplayMouseHandlers();
         setupFieldDisplayKeyHandlers();
+        setupMissionScriptListeners();
 
         startUdpPositionListener();
         startUdpPlotListener();
@@ -179,30 +186,336 @@ public class FtcFieldSimulatorApp extends Application {
 
         updateUIFromRobotState();
         updateControlPanelForPathState();
+        updateMissionScriptFromState();
         updateTimeLapsedDisplay();
     }
 
     private void setupFieldDisplayKeyHandlers() {
         if (fieldDisplay == null) return;
-        fieldDisplay.setOnPointDeleteAction(this::handleDeletePoint);
+        fieldDisplay.setOnPointDeleteAction(p -> {
+            handleDeletePoint(p);
+            updateMissionScriptFromState();
+        });
+    }
+
+    private void setupMissionScriptListeners() {
+        controlPanel.getMissionScriptArea().textProperty().addListener((obs, oldVal, newVal) -> {
+            if (!isUpdatingFromScript && !isCreatingPath) {
+                updateStateFromMissionScript(newVal);
+            }
+            if (popupScriptArea != null && !popupScriptArea.isFocused()) {
+                popupScriptArea.setText(newVal);
+            }
+        });
+    }
+
+    private void updateMissionScriptFromState() {
+        if (isUpdatingFromScript) return;
+        isUpdatingFromScript = true;
+
+        // 1. Sync Initial Pose command
+        syncInitialPoseStep();
+
+        // 2. Sync Paths from allPaths into missionSteps
+        syncPathsIntoSteps();
+
+        // 2. Reconstruct script from missionSteps
+        StringBuilder sb = new StringBuilder();
+        for (AutonomousStep step : missionSteps) {
+            sb.append(step.rawLine).append("\n");
+        }
+        
+        controlPanel.setMissionScript(sb.toString().trim());
+        isUpdatingFromScript = false;
+    }
+
+    private void syncInitialPoseStep() {
+        double startX = 0, startY = 0, startHeading = 0;
+        try {
+            startX = Double.parseDouble(controlPanel.getStartXField().getText());
+            startY = Double.parseDouble(controlPanel.getStartYField().getText());
+            startHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
+        } catch (Exception ignored) {}
+
+        String args = String.format(Locale.US, "%.2f, %.2f, %.2f", startX, startY, startHeading);
+        AutonomousStep poseStep = AutonomousStep.command("SetInitialPoseCommand", args, "Start Pose");
+        
+        for (int i = 0; i < missionSteps.size(); i++) {
+            AutonomousStep s = missionSteps.get(i);
+            if (s.type == AutonomousStep.Type.CMD && s.rawLine.contains("SetInitialPoseCommand")) {
+                missionSteps.set(i, poseStep);
+                return;
+            }
+        }
+        // Add at the top if missing
+        missionSteps.add(0, poseStep);
+    }
+
+    private void syncPathsIntoSteps() {
+        // We need to make sure every PathData in allPaths has a corresponding block in missionSteps.
+        // And we remove blocks for paths no longer in allPaths.
+        
+        // Find all current path blocks in missionSteps
+        List<PathData> pathsInSteps = new ArrayList<>();
+        for (AutonomousStep s : missionSteps) {
+            if (s.type == AutonomousStep.Type.PATH_HEADER && s.pathRef != null) {
+                pathsInSteps.add(s.pathRef);
+            }
+        }
+
+        // Remove steps for deleted paths
+        missionSteps.removeIf(s -> (s.type == AutonomousStep.Type.PATH_HEADER || s.type == AutonomousStep.Type.POINT) 
+                                     && s.pathRef != null && !allPaths.contains(s.pathRef));
+
+        // Update existing blocks or add new ones
+        for (PathData path : allPaths) {
+            if (pathsInSteps.contains(path)) {
+                updatePathInSteps(path);
+            } else {
+                appendPathToSteps(path);
+            }
+        }
+    }
+
+    private void updatePathInSteps(PathData path) {
+        // Find header
+        int headerIdx = -1;
+        for (int i = 0; i < missionSteps.size(); i++) {
+            if (missionSteps.get(i).type == AutonomousStep.Type.PATH_HEADER && missionSteps.get(i).pathRef == path) {
+                headerIdx = i;
+                break;
+            }
+        }
+        if (headerIdx == -1) return;
+
+        double hField = parseHeadingExpression(path.followAngle, isRedAlliance);
+
+        // Update header string (in case name or heading changed)
+        missionSteps.get(headerIdx).updatePathHeader(path.name, hField, "IMMEDIATE");
+
+        // Remove old points for this path
+        int idx = headerIdx + 1;
+        while (idx < missionSteps.size() && missionSteps.get(idx).type == AutonomousStep.Type.POINT && missionSteps.get(idx).pathRef == path) {
+            missionSteps.remove(idx);
+        }
+
+        // Add current points
+        for (int i = 0; i < path.points.size(); i++) {
+            AutonomousStep pStep = AutonomousStep.point(path.points.get(i));
+            pStep.pathRef = path;
+            pStep.pointRef = path.points.get(i);
+            missionSteps.add(headerIdx + 1 + i, pStep);
+        }
+    }
+
+    private void appendPathToSteps(PathData path) {
+        // Add at the end
+        missionSteps.add(new AutonomousStep(AutonomousStep.Type.EMPTY, ""));
+        AutonomousStep header = AutonomousStep.pathHeader(path.name, path.followAngle, "IMMEDIATE");
+        header.pathRef = path;
+        missionSteps.add(header);
+        for (CurvePoint p : path.points) {
+            AutonomousStep pStep = AutonomousStep.point(p);
+            pStep.pathRef = path;
+            pStep.pointRef = p;
+            missionSteps.add(pStep);
+        }
+    }
+
+    private void updateStateFromMissionScript(String script) {
+        isUpdatingFromScript = true;
+        missionSteps.clear();
+        allPaths.clear();
+        
+        boolean hasInitialPose = false;
+        PathData currentPath = null;
+        String[] lines = script.split("\\r?\\n");
+        
+        for (String line : lines) {
+            String trimmed = line.trim();
+            AutonomousStep step;
+            
+            if (trimmed.startsWith("PATH:")) {
+                step = new AutonomousStep(AutonomousStep.Type.PATH_HEADER, line);
+                String name = "Path";
+                Matcher m = Pattern.compile("name=\"(.*?)\"").matcher(line);
+                if (m.find()) name = m.group(1);
+                currentPath = new PathData(name);
+                m = Pattern.compile("heading=([^\\s|]+)").matcher(line);
+                if (m.find()) currentPath.followAngle = m.group(1).trim();
+                
+                step.pathRef = currentPath;
+                allPaths.add(currentPath);
+            } else if (trimmed.startsWith("P:")) {
+                step = new AutonomousStep(AutonomousStep.Type.POINT, line);
+                if (currentPath != null) {
+                    CurvePoint cp = parsePointLine(line);
+                    if (cp != null) {
+                        currentPath.points.add(cp);
+                        step.pathRef = currentPath;
+                        step.pointRef = cp;
+                    }
+                }
+            } else if (trimmed.startsWith("WAIT:")) {
+                step = new AutonomousStep(AutonomousStep.Type.WAIT, line);
+            } else if (trimmed.startsWith("CMD:")) {
+                step = new AutonomousStep(AutonomousStep.Type.CMD, line);
+                if (trimmed.contains("SetInitialPoseCommand")) {
+                    parseSetInitialPose(line);
+                    hasInitialPose = true;
+                }
+            } else if (trimmed.isEmpty()) {
+                step = new AutonomousStep(AutonomousStep.Type.EMPTY, "");
+            } else {
+                step = new AutonomousStep(AutonomousStep.Type.COMMENT, line);
+            }
+            missionSteps.add(step);
+        }
+
+        if (hasInitialPose) {
+            handleRobotStartFieldFocusLost();
+        }
+
+        if (selectedPath == null && !allPaths.isEmpty()) {
+            selectedPath = allPaths.get(0);
+        } else if (!allPaths.contains(selectedPath)) {
+            selectedPath = allPaths.isEmpty() ? null : allPaths.get(allPaths.size() - 1);
+        }
+
+        if (fieldDisplay != null) {
+            fieldDisplay.setPathsToDraw(allPaths, selectedPath);
+            fieldDisplay.drawCurrentState();
+        }
+        updateControlPanelForPathState();
+        isUpdatingFromScript = false;
+    }
+
+    private CurvePoint parsePointLine(String line) {
+        String content = line.substring(2).trim();
+        String[] p = content.split(",");
+        if (p.length >= 7) {
+            try {
+                return new CurvePoint(
+                    evalScriptExpr(p[0]),
+                    evalScriptExpr(p[1]),
+                    evalScriptExpr(p[2]),
+                    evalScriptExpr(p[3]),
+                    evalScriptExpr(p[4]),
+                    Math.toRadians(evalScriptExpr(p[5])),
+                    evalScriptExpr(p[6])
+                );
+            } catch (Exception e) {
+                System.err.println("Error parsing point line: " + line);
+            }
+        }
+        return null;
+    }
+
+    private void parseSetInitialPose(String line) {
+        Pattern argsPattern = Pattern.compile("args=\\[(.*?)\\]");
+        Matcher m = argsPattern.matcher(line);
+        if (m.find()) {
+            String[] parts = m.group(1).split(",");
+            if (parts.length >= 3) {
+                try {
+                    double x = evalScriptExpr(parts[0]);
+                    double y = evalScriptExpr(parts[1]);
+                    double h = evalScriptExpr(parts[2]);
+                    
+                    controlPanel.getStartXField().setText(String.format(Locale.US, "%.2f", x));
+                    controlPanel.getStartYField().setText(String.format(Locale.US, "%.2f", y));
+                    controlPanel.getStartHeadingField().setText(String.format(Locale.US, "%.2f", h));
+                    
+                    handleRobotStartFieldFocusLost();
+                } catch (Exception e) {
+                    System.err.println("Error parsing SetInitialPoseCommand args: " + line);
+                }
+            }
+        }
+    }
+
+    private String wrapY(String expr, double allianceMultiplier) {
+        expr = expr.trim();
+        if (expr.startsWith("y(")) return expr;
+        try {
+            double val = Double.parseDouble(expr);
+            if (Math.abs(allianceMultiplier - 1.0) < 1e-9) {
+                return String.format(Locale.US, "%.2f", val);
+            }
+            return String.format(Locale.US, "y(%.2f)", val * allianceMultiplier);
+        } catch (Exception e) {
+            return expr;
+        }
+    }
+
+    private String wrapH(double redDegrees, String originalExpr, double allianceMultiplier) {
+        if (Math.abs(allianceMultiplier - 1.0) < 1e-9) {
+            return String.format(Locale.US, "%.2f", redDegrees);
+        }
+        if (originalExpr != null) {
+            originalExpr = originalExpr.trim();
+            if (originalExpr.startsWith("h(")) {
+                return String.format(Locale.US, "h(%.2f)", normalizeDegrees(180.0 - redDegrees));
+            } else if (originalExpr.startsWith("reflectH(")) {
+                Matcher m = Pattern.compile("reflectH\\(\\s*[\\d\\.\\-]+\\s*,\\s*([\\d\\.\\-]+)\\s*\\)").matcher(originalExpr);
+                if (m.find()) {
+                    double axis = Double.parseDouble(m.group(1));
+                    return String.format(Locale.US, "reflectH(%.2f, %.2f)", normalizeDegrees(2 * axis - redDegrees), axis);
+                }
+            }
+        }
+        return String.format(Locale.US, "h(%.2f)", normalizeDegrees(180.0 - redDegrees));
+    }
+
+    private double evalScriptExpr(String expr) {
+        expr = expr.trim();
+        try {
+            return Double.parseDouble(expr);
+        } catch (NumberFormatException e) {
+            return 0.0;
+        }
+    }
+
+    private double normalizeDegrees(double deg) {
+        while (deg > 180) deg -= 360;
+        while (deg <= -180) deg += 360;
+        return deg;
+    }
+
+    private void handlePathSelectionChanged(ObservableValue<? extends PathData> obs, PathData oldVal, PathData newVal) {
+        // If we're currently creating a path, we ignore selection changes from the ComboBox
+        // to prevent programmatic updates from resetting the selected path.
+        if (isCreatingPath) return;
+        
+        if (newVal != null && newVal != selectedPath) {
+            selectedPath = newVal;
+            // Update follow angle field for the new selected path
+            controlPanel.getFollowAngleField().setText(selectedPath.followAngle);
+            updateControlPanelForPathState();
+            if (fieldDisplay != null) {
+                fieldDisplay.setPathsToDraw(allPaths, selectedPath);
+                fieldDisplay.drawCurrentState();
+            }
+        }
     }
 
     private void handleDeletePoint(CurvePoint pointToDelete) {
-        if (pointToDelete == null || !currentPath.contains(pointToDelete)) return;
+        if (selectedPath == null || pointToDelete == null || !selectedPath.points.contains(pointToDelete)) return;
 
-        int deletedIndex = currentPath.indexOf(pointToDelete);
-        currentPath.remove(pointToDelete);
+        int deletedIndex = selectedPath.points.indexOf(pointToDelete);
+        selectedPath.points.remove(pointToDelete);
 
-        if (deletedIndex == 0 && !currentPath.isEmpty()) {
-            CurvePoint newFirstPoint = currentPath.get(0);
+        if (deletedIndex == 0 && allPaths.indexOf(selectedPath) == 0 && !selectedPath.points.isEmpty()) {
+            CurvePoint newFirstPoint = selectedPath.points.get(0);
             robot.setPosition(newFirstPoint.x, newFirstPoint.y);
             controlPanel.updateRobotStartFields(newFirstPoint.x, newFirstPoint.y, robot.getHeadingDegrees());
         }
 
         fieldDisplay.setHighlightedPoint(null);
-        fieldDisplay.setPathToDraw(currentPath);
+        fieldDisplay.setPathsToDraw(allPaths, selectedPath);
         updateControlPanelForPathState();
         updateUIFromRobotState();
+        updateMissionScriptFromState(); // Add this line
 
         instructionLabel.setText("Deleted Point " + (deletedIndex + 1) + ".");
     }
@@ -211,33 +524,59 @@ public class FtcFieldSimulatorApp extends Application {
         if (fieldDisplay == null) return;
         fieldDisplay.setOnSegmentClick(this::handleInsertPoint);
         fieldDisplay.setOnPointDrag((index, newCoords) -> {
-            if (index == 0) {
+            if (selectedPath == null) return;
+            if (index == 0 && allPaths.indexOf(selectedPath) == 0) {
                 controlPanel.updateRobotStartFields(newCoords.getX(), newCoords.getY(), robot.getHeadingDegrees());
                 robot.setPosition(newCoords.getX(), newCoords.getY());
             }
-            if (controlPanel.getSelectedPointFromComboBox() != currentPath.get(index)) {
-                controlPanel.updatePointSelectionComboBox(currentPath, currentPath.get(index));
+            // Chaining logic: if this is the last point, and there's a next path, update next path's first point
+            if (index == selectedPath.points.size() - 1) {
+                int pathIndex = allPaths.indexOf(selectedPath);
+                if (pathIndex < allPaths.size() - 1) {
+                    PathData nextPath = allPaths.get(pathIndex + 1);
+                    if (!nextPath.points.isEmpty()) {
+                        nextPath.points.get(0).x = newCoords.getX();
+                        nextPath.points.get(0).y = newCoords.getY();
+                    }
+                }
             }
-            controlPanel.loadParametersForPoint(currentPath.get(index));
+            // If this is the first point and not the first path, we shouldn't really be dragging it independently
+            // but for now let's just update the previous path's last point
+            if (index == 0) {
+                int pathIndex = allPaths.indexOf(selectedPath);
+                if (pathIndex > 0) {
+                    PathData prevPath = allPaths.get(pathIndex - 1);
+                    if (!prevPath.points.isEmpty()) {
+                        prevPath.points.get(prevPath.points.size() - 1).x = newCoords.getX();
+                        prevPath.points.get(prevPath.points.size() - 1).y = newCoords.getY();
+                    }
+                }
+            }
+
+            if (controlPanel.getSelectedPointFromComboBox() != selectedPath.points.get(index)) {
+                controlPanel.updatePointSelectionComboBox(selectedPath.points, selectedPath.points.get(index));
+            }
+            controlPanel.loadParametersForPoint(selectedPath.points.get(index));
             instructionLabel.setText(String.format(Locale.US, "Dragging Point %d to (X:%.1f, Y:%.1f)",
                     index + 1, newCoords.getX(), newCoords.getY()));
         });
 
         fieldDisplay.setOnPointDragEnd(index -> {
-            if (index >= 0 && index < currentPath.size()) {
-                CurvePoint point = currentPath.get(index);
+            if (selectedPath != null && index >= 0 && index < selectedPath.points.size()) {
+                CurvePoint point = selectedPath.points.get(index);
                 instructionLabel.setText(String.format(Locale.US, "Moved Point %d.", index + 1));
-                controlPanel.updatePointSelectionComboBox(currentPath, point);
+                controlPanel.updatePointSelectionComboBox(selectedPath.points, point);
+                updateMissionScriptFromState();
             }
         });
     }
 
     private void handleInsertPoint(int segmentIndex, Point2D clickCoordsPixels) {
-        if (segmentIndex < 0 || segmentIndex >= currentPath.size() - 1) return;
+        if (selectedPath == null || segmentIndex < 0 || segmentIndex >= selectedPath.points.size() - 1) return;
 
         Point2D clickCoordsInches = fieldDisplay.pixelToInches(clickCoordsPixels.getX(), clickCoordsPixels.getY());
-        CurvePoint startPoint = currentPath.get(segmentIndex);
-        CurvePoint endPoint = currentPath.get(segmentIndex + 1);
+        CurvePoint startPoint = selectedPath.points.get(segmentIndex);
+        CurvePoint endPoint = selectedPath.points.get(segmentIndex + 1);
 
         double newMoveSpeed = (startPoint.moveSpeed + endPoint.moveSpeed) / 2.0;
         double newTurnSpeed = (startPoint.turnSpeed + endPoint.turnSpeed) / 2.0;
@@ -246,11 +585,12 @@ public class FtcFieldSimulatorApp extends Application {
         double newSlowDownTurnAmount = (startPoint.slowDownTurnAmount + endPoint.slowDownTurnAmount) / 2.0;
 
         CurvePoint newPoint = new CurvePoint(clickCoordsInches.getX(), clickCoordsInches.getY(), newMoveSpeed, newTurnSpeed, newFollowDistance, newSlowDownTurnRadians, newSlowDownTurnAmount);
-        currentPath.add(segmentIndex + 1, newPoint);
-        fieldDisplay.setPathToDraw(currentPath);
+        selectedPath.points.add(segmentIndex + 1, newPoint);
+        fieldDisplay.setPathsToDraw(allPaths, selectedPath);
         fieldDisplay.setHighlightedPoint(newPoint);
         updateControlPanelForPathState();
         updateUIFromRobotState();
+        updateMissionScriptFromState();
 
         instructionLabel.setText("Inserted new point " + (segmentIndex + 2) + ".");
     }
@@ -298,9 +638,11 @@ public class FtcFieldSimulatorApp extends Application {
     private void setupControlPanelActions(Stage ownerStage) {
         controlPanel.setOnNewPathAction(event -> startNewPathCreation());
         controlPanel.setOnDeletePathAction(event -> deleteCurrentPath());
-        controlPanel.setOnImportCodeAction(event -> showImportCodeDialog());
-        controlPanel.setOnExportCodeAction(event -> exportPathToCode());
-        controlPanel.setOnSendPathAction(event -> handleSendPathToRobot());
+        controlPanel.setOnPathSelectionAction(this::handlePathSelectionChanged);
+        controlPanel.setOnImportCodeAction(event -> showImportMissionDialog());
+        controlPanel.setOnExportCodeAction(event -> exportMissionToCode());
+        controlPanel.setOnEditMissionAction(event -> showMissionScriptEditor());
+        controlPanel.setOnSendMissionAction(event -> handleSendMissionToRobot());
         controlPanel.setOnClearTrailAction(event -> {
             fieldDisplay.clearTrail();
             fieldDisplay.drawCurrentState();
@@ -323,27 +665,73 @@ public class FtcFieldSimulatorApp extends Application {
         }
     }
 
-    private void showImportCodeDialog() {
+    private void showMissionScriptEditor() {
+        if (missionEditorStage == null) {
+            missionEditorStage = new Stage();
+            missionEditorStage.setTitle("Mission Script Editor");
+            missionEditorStage.initOwner(primaryStage);
+
+            popupScriptArea = new TextArea(controlPanel.getMissionScript());
+            popupScriptArea.setFont(Font.font("Consolas", 14));
+            popupScriptArea.setPrefSize(800, 600);
+
+            // Sync: Popup -> ControlPanel (which then syncs to state)
+            popupScriptArea.textProperty().addListener((obs, oldVal, newVal) -> {
+                if (popupScriptArea.isFocused()) {
+                    controlPanel.setMissionScript(newVal);
+                }
+            });
+
+            // Hint section
+            TextArea hintArea = new TextArea();
+            hintArea.setEditable(false);
+            hintArea.setPrefHeight(130);
+            hintArea.setFont(Font.font("Consolas", 12));
+            hintArea.setText(
+                "# Quick Reference (Copy & Paste templates):\n" +
+                "CMD: SetInitialPoseCommand | args=[-62.04, y(14.00), 0.00] | name=\"Start\"\n" +
+                "PATH: name=\"Drive to Shoot\" | heading=90.0 | transition=IMMEDIATE\n" +
+                "P: -60.0, 10.0, 1.0, 0.4, 10.0, 60.0, 0.60\n" +
+                "WAIT: 1.5\n" +
+                "CMD: Shoot3BallsCommand | args=[] | name=\"Action Name\""
+            );
+            hintArea.setStyle("-fx-control-inner-background: #F5F5F5; -fx-text-fill: #555;");
+
+            VBox root = new VBox(10, new Label("Edit Mission Script:"), popupScriptArea, new Label("Available Step Formats:"), hintArea);
+            VBox.setVgrow(popupScriptArea, Priority.ALWAYS);
+            root.setPadding(new Insets(10));
+
+            Scene scene = new Scene(root, 900, 800);
+            missionEditorStage.setScene(scene);
+        } else {
+            popupScriptArea.setText(controlPanel.getMissionScript());
+        }
+
+        missionEditorStage.show();
+        missionEditorStage.toFront();
+    }
+
+    private void showImportMissionDialog() {
         Dialog<ImportResult> dialog = new Dialog<>();
-        dialog.setTitle("Import Path from Code");
-        dialog.setHeaderText("Paste your Java code snippet below and select the alliance.");
+        dialog.setTitle("Import Mission from Java Code");
+        dialog.setHeaderText("Paste your robot autonomous code snippet below.");
         dialog.setResizable(true);
 
         TextArea textArea = new TextArea();
-        textArea.setPromptText("pathToSpike1.add(new CurvePoint(...));");
+        textArea.setPromptText("public void buildAuto() {\n  scheduler.add(...);\n  ...\n}");
         textArea.setFont(Font.font("Consolas", 14));
-        textArea.setPrefHeight(300);
-        textArea.setPrefWidth(650);
+        textArea.setPrefHeight(400);
+        textArea.setPrefWidth(800);
 
         ComboBox<String> allianceSelector = new ComboBox<>();
         allianceSelector.getItems().addAll("Blue Alliance", "Red Alliance");
         allianceSelector.setValue(isRedAlliance ? "Red Alliance" : "Blue Alliance");
         allianceSelector.setMaxWidth(Double.MAX_VALUE);
 
-        VBox content = new VBox(10, new Label("Java Code Snippet:"), textArea, new Label("Alliance for this path:"), allianceSelector);
+        VBox content = new VBox(10, new Label("Java Code Snippet:"), textArea, new Label("Alliance context:"), allianceSelector);
         VBox.setVgrow(textArea, Priority.ALWAYS);
         dialog.getDialogPane().setContent(content);
-        dialog.getDialogPane().setPrefSize(650, 480);
+        dialog.getDialogPane().setPrefSize(800, 600);
 
         ButtonType importButtonType = new ButtonType("Import", ButtonBar.ButtonData.OK_DONE);
         dialog.getDialogPane().getButtonTypes().addAll(importButtonType, ButtonType.CANCEL);
@@ -356,95 +744,434 @@ public class FtcFieldSimulatorApp extends Application {
         });
 
         Optional<ImportResult> result = dialog.showAndWait();
-        result.ifPresent(res -> parseAndImportPath(res.code, res.isRed));
+        result.ifPresent(res -> {
+            this.isRedAlliance = res.isRed;
+            String missionScript = parseJavaToMission(res.code, res.isRed);
+            controlPanel.setMissionScript(missionScript);
+            updateStateFromMissionScript(missionScript);
+        });
     }
 
-    private void parseAndImportPath(String code, boolean importedAsRed) {
-        List<CurvePoint> newPath = new ArrayList<>();
-        double startX = -1, startY = -1, startHeading = 0;
-        boolean poseFound = false;
+    private String parseJavaToMission(String code, boolean isRed) {
+        StringBuilder script = new StringBuilder();
+        double allianceMultiplier = isRed ? -1.0 : 1.0;
 
-        this.isRedAlliance = importedAsRed;
-        double allianceMultiplier = isRedAlliance ? -1.0 : 1.0;
+        // Remove comments
+        code = code.replaceAll("//.*", "");
+        code = code.replaceAll("(?s)/\\*.*?\\*/", "");
 
-        Pattern posePattern = Pattern.compile("new\\s+Pose2D\\([^,]+,\\s*([\\d\\.\\-]+),\\s*(?:y\\(([\\d\\.\\-]+)\\)|([\\d\\.\\-]+)),\\s*[^,]+,\\s*([\\d\\.\\-]+)\\)");
-        Pattern curvePointPattern = Pattern.compile(
-                "new\\s+CurvePoint\\(\\s*([\\d\\.\\-]+),\\s*(?:y\\(([\\d\\.\\-]+)\\)|([\\d\\.\\-]+)),\\s*([\\d\\.\\-]+)," +
-                        "\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+),\\s*Math\\.toRadians\\(([\\d\\.\\-]+)\\)," +
-                        "\\s*([\\d\\.\\-]+)\\)"
-        );
+        // Pre-process: Join multi-line method chaining and constructor calls
+        code = code.replaceAll("\\r?\\n\\s*\\.", ".");
+        code = code.replaceAll(",\\s*\\r?\\n", ", ");
+        code = code.replaceAll("\\(\\s*\\r?\\n", "(");
 
+        // 1. Detect start position (INIT)
+        // Look for Pose2D(world, x, y, h) or Pose2D(x, y, h) or inside SetInitialPoseCommand
+        Pattern posePattern = Pattern.compile("(?:new\\s+Pose2D|new\\s+SetInitialPoseCommand)\\s*\\(\\s*(?:[^,]*\\s*,\\s*)?([\\d\\.\\-]+)\\s*,\\s*(?:y\\(\\s*([\\d\\.\\-]+)\\s*\\)|([\\d\\.\\-]+))\\s*,\\s*(?:[^,]*\\s*,\\s*)?([^,)]+)\\s*\\)");
+        Matcher poseMatcher = posePattern.matcher(code);
+        String initialPoseLine = null;
+        if (poseMatcher.find()) {
+            double x = Double.parseDouble(poseMatcher.group(1));
+            double y = (poseMatcher.group(2) != null) ? Double.parseDouble(poseMatcher.group(2)) * allianceMultiplier : Double.parseDouble(poseMatcher.group(3)) * allianceMultiplier;
+            String hExprStr = poseMatcher.group(4).trim();
+            double hField = parseHeadingExpression(hExprStr, isRed);
+            initialPoseLine = AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine;
+        }
+
+        // 2. Multi-pass parsing for paths and commands
+        boolean sequenceHasInitialPose = false;
+        Map<String, List<CurvePoint>> pathsFound = new HashMap<>();
+        Pattern pointPattern = Pattern.compile("(\\w+)\\.add\\(new\\s+CurvePoint\\(\\s*([\\d\\.\\-]+),\\s*(?:y\\(\\s*([\\d\\.\\-]+)\\s*\\)|([\\d\\.\\-]+)),\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+),\\s*([\\d\\.\\-]+),\\s*Math\\.toRadians\\(\\s*(.*?)\\s*\\),\\s*([\\d\\.\\-]+)\\)\\)");
+        
         String[] lines = code.split("\\r?\\n");
         for (String line : lines) {
-            if (!poseFound) {
-                Matcher poseMatcher = posePattern.matcher(line);
-                if (poseMatcher.find()) {
-                    try {
-                        startX = Double.parseDouble(poseMatcher.group(1));
-                        String yGroupVal = poseMatcher.group(2);
-                        if (yGroupVal != null) {
-                            startY = Double.parseDouble(yGroupVal) * allianceMultiplier;
-                        } else {
-                            startY = Double.parseDouble(poseMatcher.group(3));
-                        }
-                        startHeading = Double.parseDouble(poseMatcher.group(4));
-                        poseFound = true;
-                    } catch (NumberFormatException e) {
-                        System.err.println("Could not parse Pose2D line: " + line);
-                    }
+            line = line.trim();
+            
+            // Collect points into path buffers
+            Matcher pm = pointPattern.matcher(line);
+            if (pm.find()) {
+                String pathVar = pm.group(1);
+                double px = Double.parseDouble(pm.group(2));
+                
+                String yGroup3 = pm.group(3);
+                String yGroup4 = pm.group(4);
+                double py;
+                if (yGroup3 != null) {
+                    py = Double.parseDouble(yGroup3) * allianceMultiplier;
+                } else {
+                    py = Double.parseDouble(yGroup4);
                 }
+                
+                double ms = Double.parseDouble(pm.group(5));
+                double ts = Double.parseDouble(pm.group(6));
+                double fd = Double.parseDouble(pm.group(7));
+                String slowTurnDegStr = pm.group(8).trim();
+                double slowTurnDeg = Double.parseDouble(slowTurnDegStr);
+                
+                double sAmt = Double.parseDouble(pm.group(9));
+                
+                pathsFound.computeIfAbsent(pathVar, k -> new ArrayList<>()).add(new CurvePoint(px, py, ms, ts, fd, Math.toRadians(slowTurnDeg), sAmt));
+                continue;
             }
 
-            Matcher curvePointMatcher = curvePointPattern.matcher(line);
-            if (curvePointMatcher.find()) {
-                try {
-                    double x = Double.parseDouble(curvePointMatcher.group(1));
-                    double y;
-                    String yGroupVal = curvePointMatcher.group(2);
-                    if (yGroupVal != null) {
-                        y = Double.parseDouble(yGroupVal) * allianceMultiplier;
-                    } else {
-                        y = Double.parseDouble(curvePointMatcher.group(3));
-                    }
-                    double moveSpeed = Double.parseDouble(curvePointMatcher.group(4));
-                    double turnSpeed = Double.parseDouble(curvePointMatcher.group(5));
-                    double followDistance = Double.parseDouble(curvePointMatcher.group(6));
-                    double slowDownTurnDeg = Double.parseDouble(curvePointMatcher.group(7));
-                    double slowDownTurnAmount = Double.parseDouble(curvePointMatcher.group(8));
+            // Detect scheduler.add() calls
+            if (line.contains("scheduler.add(")) {
+                if (line.contains("FollowPathCommand")) {
+                    // Match: new FollowPathCommand(pathVar, heading, debug [, dist])
+                    Pattern fpcPattern = Pattern.compile("new\\s+FollowPathCommand\\(\\s*(\\w+)\\s*,\\s*(.*?)\\s*,\\s*[^,)]+(?:\\s*,\\s*([^,)]+))?");
+                    Matcher fm = fpcPattern.matcher(line);
+                    if (fm.find()) {
+                        String pathVar = fm.group(1);
+                        String hExprStr = fm.group(2).trim(); 
+                        double hField = parseHeadingExpression(hExprStr, isRed);
+                        String hExprForScript = wrapH(hField, hExprStr, allianceMultiplier);
+                        
+                        String stepName = "Drive";
+                        Matcher nm = Pattern.compile("\\.withName\\(\"(.*?)\"\\)").matcher(line);
+                        if (nm.find()) stepName = nm.group(1);
+                        
+                        String trans = "IMMEDIATE";
+                        // If 4th constructor argument exists, use it as default transition
+                        if (fm.group(3) != null) {
+                            trans = "DIST(" + fm.group(3).trim() + ")";
+                        }
+                        
+                        // Chained method overrides constructor argument
+                        if (line.contains("transitionWhenDistancetoEndIsLessThan")) {
+                            Matcher tm = Pattern.compile("transitionWhenDistancetoEndIsLessThan\\((.*?)\\)").matcher(line);
+                            if (tm.find()) trans = "DIST(" + tm.group(1).trim() + ")";
+                        }
+                        if (line.contains("transitionImmediately()")) {
+                            trans = "IMMEDIATE";
+                        }
 
-                    newPath.add(new CurvePoint(x, y, moveSpeed, turnSpeed, followDistance, Math.toRadians(slowDownTurnDeg), slowDownTurnAmount));
-                } catch (NumberFormatException e) {
-                    System.err.println("Could not parse CurvePoint line: " + line);
+                        script.append(AutonomousStep.pathHeader(stepName, hField, trans).rawLine).append("\n");
+                        List<CurvePoint> points = pathsFound.get(pathVar);
+                        if (points != null) {
+                            for (CurvePoint p : points) {
+                                script.append(AutonomousStep.point(p).rawLine).append("\n");
+                            }
+                        }
+                        script.append("\n");
+                    }
+                } else if (line.contains("SetInitialPoseCommand")) {
+                    sequenceHasInitialPose = true;
+                    // Already handled by INIT detection at the top, or capture here if it appears in scheduler
+                    Pattern sipc = Pattern.compile("(?:new\\s+Pose2D|SetInitialPoseCommand)\\s*\\(\\s*(?:[^,]*\\s*,\\s*)?([\\d\\.\\-]+)\\s*,\\s*(?:y\\(\\s*([\\d\\.\\-]+)\\s*\\)|([\\d\\.\\-]+))\\s*,\\s*(?:[^,]*\\s*,\\s*)?([^,)]+)\\s*\\)");
+                    Matcher sm = sipc.matcher(line);
+                    if (sm.find()) {
+                        double x = Double.parseDouble(sm.group(1));
+                        double y = (sm.group(2) != null) ? Double.parseDouble(sm.group(2)) * allianceMultiplier : Double.parseDouble(sm.group(3)) * allianceMultiplier;
+                        String hExprStr = sm.group(4).trim();
+                        double hField = parseHeadingExpression(hExprStr, isRed);
+                        script.append(AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine).append("\n");
+                    }
+                } else if (line.contains("WaitCommand")) {
+                    Matcher wm = Pattern.compile("WaitCommand\\((.*?)\\)").matcher(line);
+                    if (wm.find()) {
+                        script.append(AutonomousStep.waitStep(Double.parseDouble(wm.group(1).trim())).rawLine).append("\n");
+                    }
+                } else {
+                    // Generic command - handles one level of nested parentheses for y() calls
+                    Pattern cmPattern = Pattern.compile("new\\s+(\\w+)\\(([^)]*(\\([^)]*\\)[^)]*)*)\\)");
+                    Matcher cm = cmPattern.matcher(line);
+                    if (cm.find()) {
+                        String className = cm.group(1);
+                        String args = cm.group(2).trim();
+                        
+                        // Resolve mirror functions to raw field values for the script
+                        args = resolveMirrorFunctionsToFieldValues(args, isRed);
+                        
+                        String stepName = "";
+                        Matcher nm = Pattern.compile("\\.withName\\(\"(.*?)\"\\)").matcher(line);
+                        if (nm.find()) stepName = nm.group(1);
+                        script.append(AutonomousStep.command(className, args, stepName).rawLine).append("\n");
+                    }
                 }
             }
         }
+        
+        if (!sequenceHasInitialPose && initialPoseLine != null) {
+            script.insert(0, initialPoseLine + "\n\n");
+        }
 
-        if (newPath.isEmpty()) {
-            instructionLabel.setText("Import failed: No valid 'new CurvePoint(...)' lines found.");
+        return script.toString();
+    }
+
+    private String formatYForJava(double fieldY, double allianceMultiplier) {
+        double blueY = fieldY * allianceMultiplier;
+        return String.format(Locale.US, "y(%.2f)", blueY);
+    }
+
+    private String formatHForJava(double fieldHeading, boolean isRed) {
+        double blueH = isRed ? normalizeDegrees(180.0 - fieldHeading) : fieldHeading;
+        return String.format(Locale.US, "h(%.2f)", blueH);
+    }
+
+    private String resolveMirrorFunctionsToFieldValues(String args, boolean isRed) {
+        double allianceMultiplier = isRed ? -1.0 : 1.0;
+        
+        // Resolve y()
+        Pattern yPattern = Pattern.compile("y\\(\\s*([\\d\\.\\-]+)\\s*\\)");
+        Matcher ym = yPattern.matcher(args);
+        StringBuilder sb = new StringBuilder();
+        int lastEnd = 0;
+        while (ym.find()) {
+            sb.append(args, lastEnd, ym.start());
+            double val = Double.parseDouble(ym.group(1));
+            sb.append(String.format(Locale.US, "%.2f", val * allianceMultiplier));
+            lastEnd = ym.end();
+        }
+        sb.append(args.substring(lastEnd));
+        args = sb.toString();
+
+        // Resolve h()
+        Pattern hPattern = Pattern.compile("h\\(\\s*([\\d\\.\\-]+)\\s*\\)");
+        Matcher hm = hPattern.matcher(args);
+        sb = new StringBuilder();
+        lastEnd = 0;
+        while (hm.find()) {
+            sb.append(args, lastEnd, hm.start());
+            double val = Double.parseDouble(hm.group(1));
+            double res = isRed ? normalizeDegrees(180.0 - val) : val;
+            sb.append(String.format(Locale.US, "%.2f", res));
+            lastEnd = hm.end();
+        }
+        sb.append(args.substring(lastEnd));
+        args = sb.toString();
+
+        // Resolve reflectH()
+        Pattern rhPattern = Pattern.compile("reflectH\\(\\s*([\\d\\.\\-]+)\\s*,\\s*([\\d\\.\\-]+)\\s*\\)");
+        Matcher rhm = rhPattern.matcher(args);
+        sb = new StringBuilder();
+        lastEnd = 0;
+        while (rhm.find()) {
+            sb.append(args, lastEnd, rhm.start());
+            double val = Double.parseDouble(rhm.group(1));
+            double axis = Double.parseDouble(rhm.group(2));
+            double res = isRed ? normalizeDegrees(2 * axis - val) : val;
+            sb.append(String.format(Locale.US, "%.2f", res));
+            lastEnd = rhm.end();
+        }
+        sb.append(args.substring(lastEnd));
+        return sb.toString();
+    }
+
+    private double parseHeadingExpression(String expr, boolean isRed) {
+        expr = expr.trim();
+        // Handle "isRed ? 75 : 115"
+        if (expr.contains("isRed")) {
+            Pattern expPattern = Pattern.compile("isRed\\s*\\?\\s*([\\d\\.\\-]+)\\s*:\\s*([\\d\\.\\-]+)");
+            Matcher m = expPattern.matcher(expr);
+            if (m.find()) {
+                return isRed ? Double.parseDouble(m.group(1)) : Double.parseDouble(m.group(2));
+            }
+        }
+        // Handle "h(90)"
+        if (expr.startsWith("h(")) {
+            Matcher m = Pattern.compile("h\\(\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
+            if (m.find()) {
+                double blueDeg = Double.parseDouble(m.group(1));
+                if (!isRed) return blueDeg;
+                return normalizeDegrees(180.0 - blueDeg);
+            }
+        }
+        // Handle "reflectH(90, 0)"
+        if (expr.startsWith("reflectH(")) {
+            Matcher m = Pattern.compile("reflectH\\(\\s*([\\d\\.\\-]+)\\s*,\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
+            if (m.find()) {
+                double blueDeg = Double.parseDouble(m.group(1));
+                double axis = Double.parseDouble(m.group(2));
+                if (!isRed) return blueDeg;
+                return normalizeDegrees(2 * axis - blueDeg);
+            }
+        }
+        // Handle "mirroredHeading(180)"
+        if (expr.contains("mirroredHeading")) {
+            Matcher m = Pattern.compile("mirroredHeading\\(\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
+            if (m.find()) return Double.parseDouble(m.group(1));
+        }
+        // Handle "Math.toRadians(90)"
+        if (expr.contains("Math.toRadians")) {
+            Matcher m = Pattern.compile("Math\\.toRadians\\(\\s*(.*?)\\s*\\)").matcher(expr);
+            if (m.find()) return parseHeadingExpression(m.group(1), isRed);
+        }
+        try { 
+            double val = Double.parseDouble(expr); 
+            return val;
+        } catch (Exception e) { return 0.0; }
+    }
+
+    private void exportMissionToCode() {
+        String script = controlPanel.getMissionScript();
+        if (script == null || script.isEmpty()) {
+            instructionLabel.setText("No mission script to export.");
             return;
         }
 
-        if (!poseFound) {
-            CurvePoint firstPoint = newPath.get(0);
-            startX = firstPoint.x;
-            startY = firstPoint.y;
-            startHeading = 0.0;
+        try {
+            StringBuilder code = new StringBuilder();
+            double allianceMultiplier = isRedAlliance ? -1.0 : 1.0;
+            
+            code.append("public void buildAutonomous() {\n");
+
+            String[] lines = script.split("\\r?\\n");
+            int pathCount = 1;
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i].trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+
+                if (line.startsWith("INIT:")) continue; 
+
+                if (line.startsWith("PATH:")) {
+                    String name = "Path " + pathCount;
+                    String hExpr = "0.0";
+                    String trans = "IMMEDIATE";
+                    
+                    Matcher m = Pattern.compile("name=\"(.*?)\"").matcher(line);
+                    if (m.find()) name = m.group(1);
+                    m = Pattern.compile("heading=([^\\s|]+)").matcher(line);
+                    if (m.find()) hExpr = m.group(1).trim();
+                    m = Pattern.compile("transition=([^\\s|]+)").matcher(line); 
+                    if (m.find()) trans = m.group(1);
+
+                    String varName = "path" + pathCount;
+                    code.append("    ArrayList<CurvePoint> ").append(varName).append(" = new ArrayList<>();\n");
+                    
+                    int j = i + 1;
+                    while (j < lines.length && (lines[j].trim().startsWith("P:") || lines[j].trim().isEmpty())) {
+                        String pLine = lines[j].trim();
+                        if (pLine.startsWith("P:")) {
+                            String[] p = pLine.substring(2).split(",");
+                            if (p.length < 7) { j++; continue; }
+                            
+                            double px = Double.parseDouble(p[0].trim());
+                            double py = Double.parseDouble(p[1].trim());
+                            double ms = Double.parseDouble(p[2].trim());
+                            double ts = Double.parseDouble(p[3].trim());
+                            double fd = Double.parseDouble(p[4].trim());
+                            double slowTurnDeg = Double.parseDouble(p[5].trim());
+                            double sa = Double.parseDouble(p[6].trim());
+
+                            String yExpr = formatYForJava(py, allianceMultiplier);
+                            
+                            code.append(String.format(Locale.US, "    %s.add(new CurvePoint(%.2f, %s, %.2f, %.2f, %.2f, Math.toRadians(%.1f), %.2f));\n",
+                                    varName, px, yExpr, ms, ts, fd, slowTurnDeg, sa));
+                        }
+                        j++;
+                    }
+                    double hPathField = Double.parseDouble(hExpr.trim());
+                    String hPathExpr = formatHForJava(hPathField, isRedAlliance);
+
+                    code.append("    scheduler.add(new FollowPathCommand(").append(varName).append(", ").append(hPathExpr).append(", debug)\n");
+                    if ("IMMEDIATE".equals(trans)) code.append("            .transitionImmediately()\n");
+                    else if (trans.startsWith("DIST")) {
+                        String dist = trans.substring(5, trans.length()-1);
+                        code.append("            .transitionWhenDistancetoEndIsLessThan(").append(dist).append(")\n");
+                    }
+                    code.append("            .withName(\"").append(name).append("\"));\n\n");
+                    pathCount++;
+                } else if (line.startsWith("WAIT:")) {
+                    code.append("    scheduler.add(new WaitCommand(").append(line.substring(5).trim()).append("));\n");
+                } else if (line.startsWith("CMD:")) {
+                    String content = line.substring(4).trim();
+                    String className = content;
+                    String args = "";
+                    String stepName = "";
+                    
+                    if (content.contains("|")) {
+                        String[] parts = content.split("\\|");
+                        className = parts[0].trim();
+                        for (int k = 1; k < parts.length; k++) {
+                            String part = parts[k].trim();
+                            if (part.startsWith("args=[")) args = part.substring(6, part.length()-1);
+                            if (part.startsWith("name=\"")) stepName = part.substring(6, part.length()-1);
+                        }
+                    }
+                    
+                    // Special case for SetInitialPoseCommand: wrap the second and third arguments
+                    if ("SetInitialPoseCommand".equals(className)) {
+                        String[] argParts = args.split(",");
+                        if (argParts.length >= 3) {
+                            double py = Double.parseDouble(argParts[1].trim());
+                            double hField = Double.parseDouble(argParts[2].trim());
+                            argParts[1] = formatYForJava(py, allianceMultiplier);
+                            argParts[2] = formatHForJava(hField, isRedAlliance);
+                            args = String.join(", ", argParts);
+                        }
+                    }
+                    
+                    code.append("    scheduler.add(new ").append(className).append("(").append(args).append(")");
+                    if (!stepName.isEmpty()) code.append(".withName(\"").append(stepName).append("\")");
+                    code.append(");\n");
+                }
+            }
+            
+            code.append("}\n");
+
+            showCodePopup(code.toString());
+        } catch (Exception e) {
+            instructionLabel.setText("Export failed! Check mission script syntax.");
+            Alert alert = new Alert(Alert.AlertType.ERROR);
+            alert.setTitle("Export Error");
+            alert.setHeaderText("Failed to generate Java code");
+            alert.setContentText("There is likely a syntax error in your mission script.\n\nError details: " + e.getMessage());
+            alert.showAndWait();
+            e.printStackTrace();
+        }
+    }
+
+    private void handleSendMissionToRobot() {
+        String script = controlPanel.getMissionScript();
+        if (script == null || script.trim().isEmpty()) {
+            instructionLabel.setText("No mission script to send.");
+            return;
         }
 
-        this.currentPath = newPath;
-        robot.setPosition(startX, startY, startHeading);
-        controlPanel.updateRobotStartFields(startX, startY, startHeading);
-        fieldDisplay.setPathToDraw(this.currentPath);
-        isCreatingPath = false;
-        controlPanel.setPathEditingActive(false);
-        updateControlPanelForPathState();
-        updateUIFromRobotState();
+        String robotIpAddress = controlPanel.getSelectedIpAddress();
+        if (robotIpAddress == null || robotIpAddress.trim().isEmpty()) {
+            instructionLabel.setText("No Robot IP Address selected!");
+            return;
+        }
 
-        instructionLabel.setText("Successfully imported " + newPath.size() + " points for " + (isRedAlliance ? "RED" : "BLUE") + ".");
+        instructionLabel.setText("Sending full mission script to robot...");
+        try (DatagramSocket socket = new DatagramSocket()) {
+            InetAddress address = InetAddress.getByName(robotIpAddress);
+
+            // Start signal
+            byte[] startBuffer = "MISSION_START".getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(startBuffer, startBuffer.length, address, ROBOT_LISTENER_PORT));
+
+            byte[] scriptBuffer = script.getBytes(StandardCharsets.UTF_8);
+            int offset = 0;
+            while (offset < scriptBuffer.length) {
+                int length = Math.min(scriptBuffer.length - offset, 512);
+                socket.send(new DatagramPacket(scriptBuffer, offset, length, address, ROBOT_LISTENER_PORT));
+                offset += length;
+                try { Thread.sleep(10); } catch (InterruptedException ignored) {} 
+            }
+
+            // End signal
+            byte[] endBuffer = "MISSION_END".getBytes(StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(endBuffer, endBuffer.length, address, ROBOT_LISTENER_PORT));
+            
+            instructionLabel.setText("Mission sent successfully to " + robotIpAddress);
+        } catch (IOException e) {
+            instructionLabel.setText("Error sending mission: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 
     private void setupParameterFieldListeners() {
         if (controlPanel == null) return;
+
+        controlPanel.getFollowAngleField().focusedProperty().addListener((obs, oldVal, newVal) -> {
+            if (!newVal) {
+                handleFollowAngleFieldFocusLost();
+            }
+        });
+        controlPanel.getFollowAngleField().setOnAction(event -> handleFollowAngleFieldFocusLost());
+
         for (TextField tf : controlPanel.getAllParamTextFields()) {
             tf.focusedProperty().addListener((obs, oldVal, newVal) -> {
                 if (newVal) {
@@ -468,6 +1195,18 @@ public class FtcFieldSimulatorApp extends Application {
         }
     }
 
+    private void handleFollowAngleFieldFocusLost() {
+        if (selectedPath == null) return;
+        String text = controlPanel.getFollowAngleField().getText().trim();
+        if (!text.isEmpty()) {
+            selectedPath.followAngle = text;
+            instructionLabel.setText("Follow angle updated for " + selectedPath.name);
+            updateMissionScriptFromState();
+        } else {
+            controlPanel.getFollowAngleField().setText(selectedPath.followAngle);
+        }
+    }
+
     private void handleRobotStartFieldFocusLost() {
         if (controlPanel == null || robot == null) return;
 
@@ -479,14 +1218,20 @@ public class FtcFieldSimulatorApp extends Application {
             robot.setPosition(newX, newY, newHeading);
             updateUIFromRobotState();
 
-            if (!currentPath.isEmpty()) {
-                CurvePoint firstPoint = currentPath.get(0);
-                firstPoint.x = newX;
-                firstPoint.y = newY;
-                fieldDisplay.drawCurrentState();
-                controlPanel.updatePointSelectionComboBox(currentPath, controlPanel.getSelectedPointFromComboBox());
+            if (!allPaths.isEmpty()) {
+                PathData firstPath = allPaths.get(0);
+                if (!firstPath.points.isEmpty()) {
+                    CurvePoint firstPoint = firstPath.points.get(0);
+                    firstPoint.x = newX;
+                    firstPoint.y = newY;
+                    fieldDisplay.drawCurrentState();
+                    if (selectedPath == firstPath) {
+                        controlPanel.updatePointSelectionComboBox(selectedPath.points, controlPanel.getSelectedPointFromComboBox());
+                    }
+                }
             }
             instructionLabel.setText("Robot start position updated.");
+            updateMissionScriptFromState();
 
         } catch (NumberFormatException e) {
             instructionLabel.setText("Invalid start position. Reverting.");
@@ -495,7 +1240,7 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void handleParameterFieldFocusLost(TextField textField) {
-        if (controlPanel == null || currentPath == null) return;
+        if (controlPanel == null || selectedPath == null) return;
 
         String previousText = textFieldPreviousValues.getOrDefault(textField, "");
         String currentText = textField.getText().trim();
@@ -535,16 +1280,16 @@ public class FtcFieldSimulatorApp extends Application {
 
         boolean updateOccurred = false;
         if (Objects.equals(selectedItem, ControlPanel.ALL_POINTS_MARKER)) {
-            for (CurvePoint point : currentPath) {
+            for (CurvePoint point : selectedPath.points) {
                 updateCurvePointParameter(point, textField, parsedValue);
             }
-            instructionLabel.setText("Applied '" + getFieldName(textField) + " = " + currentText + "' to all points.");
+            instructionLabel.setText("Applied '" + getFieldName(textField) + " = " + currentText + "' to all points of " + selectedPath.name + ".");
             updateOccurred = true;
             refreshParameterFieldsForAllSelected();
         } else if (selectedItem instanceof CurvePoint) {
             CurvePoint point = (CurvePoint) selectedItem;
             updateCurvePointParameter(point, textField, parsedValue);
-            int pointIndex = currentPath.indexOf(point) + 1;
+            int pointIndex = selectedPath.points.indexOf(point) + 1;
             instructionLabel.setText("Updated Point " + pointIndex + " (" + getFieldName(textField) + " = " + currentText + ").");
             updateOccurred = true;
         }
@@ -552,6 +1297,7 @@ public class FtcFieldSimulatorApp extends Application {
         if (updateOccurred) {
             textFieldPreviousValues.put(textField, currentText);
             fieldDisplay.drawCurrentState();
+            updateMissionScriptFromState();
         }
     }
 
@@ -573,21 +1319,21 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void handlePointSelectionChanged(ObservableValue<? extends Object> obs, Object oldVal, Object newVal) {
-        if (controlPanel == null || isCreatingPath) {
-            if (isCreatingPath && newVal != null && controlPanel.getSelectedPointFromComboBox() != null) {
-                Platform.runLater(() -> controlPanel.updatePointSelectionComboBox(currentPath, oldVal != null ? oldVal : ControlPanel.ALL_POINTS_MARKER));
-            }
+        if (controlPanel == null || selectedPath == null) return;
+        
+        if (isCreatingPath) {
+            // Ignore selection changes from ComboBox while creating a path
             return;
         }
 
         CurvePoint pointToHighlight = null;
 
         if (newVal == null) {
-            if (currentPath.isEmpty()) {
+            if (selectedPath.points.isEmpty()) {
                 controlPanel.loadGlobalDefaultsIntoParameterFields();
                 controlPanel.setPointEditingControlsDisabled(true);
             } else {
-                controlPanel.updatePointSelectionComboBox(currentPath, ControlPanel.ALL_POINTS_MARKER);
+                controlPanel.updatePointSelectionComboBox(selectedPath.points, ControlPanel.ALL_POINTS_MARKER);
             }
             return;
         } else if (Objects.equals(newVal, ControlPanel.ALL_POINTS_MARKER)) {
@@ -605,17 +1351,17 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void refreshParameterFieldsForAllSelected() {
-        if (controlPanel == null) return;
-        if (currentPath.isEmpty()) {
+        if (controlPanel == null || selectedPath == null) return;
+        if (selectedPath.points.isEmpty()) {
             controlPanel.loadGlobalDefaultsIntoParameterFields();
             return;
         }
 
-        checkAndSetField(currentPath, cp -> cp.moveSpeed, controlPanel.getMoveSpeedField(), "%.2f");
-        checkAndSetField(currentPath, cp -> cp.turnSpeed, controlPanel.getTurnSpeedField(), "%.2f");
-        checkAndSetField(currentPath, cp -> cp.followDistance, controlPanel.getFollowDistanceField(), "%.1f");
-        checkAndSetField(currentPath, cp -> Math.toDegrees(cp.slowDownTurnRadians), controlPanel.getSlowDownTurnDegreesField(), "%.1f");
-        checkAndSetField(currentPath, cp -> cp.slowDownTurnAmount, controlPanel.getSlowDownTurnAmountField(), "%.2f");
+        checkAndSetField(selectedPath.points, cp -> cp.moveSpeed, controlPanel.getMoveSpeedField(), "%.2f");
+        checkAndSetField(selectedPath.points, cp -> cp.turnSpeed, controlPanel.getTurnSpeedField(), "%.2f");
+        checkAndSetField(selectedPath.points, cp -> cp.followDistance, controlPanel.getFollowDistanceField(), "%.1f");
+        checkAndSetField(selectedPath.points, cp -> Math.toDegrees(cp.slowDownTurnRadians), controlPanel.getSlowDownTurnDegreesField(), "%.1f");
+        checkAndSetField(selectedPath.points, cp -> cp.slowDownTurnAmount, controlPanel.getSlowDownTurnAmountField(), "%.2f");
     }
 
     private <T> void checkAndSetField(List<CurvePoint> path, Function<CurvePoint, T> getter, TextField field, String format) {
@@ -664,25 +1410,28 @@ public class FtcFieldSimulatorApp extends Application {
     private void updateControlPanelForPathState() {
         if (controlPanel == null) return;
 
-        boolean pathExistsAndNotEmpty = !currentPath.isEmpty();
+        boolean pathsExist = !allPaths.isEmpty();
+        controlPanel.updatePathSelectionComboBox(allPaths, selectedPath);
+
+        boolean pathExistsAndNotEmpty = selectedPath != null && !selectedPath.points.isEmpty();
         controlPanel.setPointEditingControlsDisabled(!pathExistsAndNotEmpty);
-        controlPanel.enablePathControls(pathExistsAndNotEmpty);
+        controlPanel.enablePathControls(pathsExist);
 
         Object selectionToRestore = controlPanel.getSelectedPointFromComboBox();
         if (!pathExistsAndNotEmpty) {
             selectionToRestore = ControlPanel.ALL_POINTS_MARKER;
         } else {
-            if (selectionToRestore instanceof CurvePoint && !currentPath.contains(selectionToRestore)) {
+            if (selectionToRestore instanceof CurvePoint && !selectedPath.points.contains(selectionToRestore)) {
                 selectionToRestore = ControlPanel.ALL_POINTS_MARKER;
             } else if (selectionToRestore == null) {
                 selectionToRestore = ControlPanel.ALL_POINTS_MARKER;
             }
         }
-        controlPanel.updatePointSelectionComboBox(currentPath, selectionToRestore);
+        controlPanel.updatePointSelectionComboBox(selectedPath != null ? selectedPath.points : new ArrayList<>(), selectionToRestore);
 
         Object currentSelectionAfterUpdate = controlPanel.getSelectedPointFromComboBox();
         if (currentSelectionAfterUpdate == null && pathExistsAndNotEmpty) {
-            controlPanel.updatePointSelectionComboBox(currentPath, ControlPanel.ALL_POINTS_MARKER);
+            controlPanel.updatePointSelectionComboBox(selectedPath.points, ControlPanel.ALL_POINTS_MARKER);
         } else {
             if (Objects.equals(currentSelectionAfterUpdate, ControlPanel.ALL_POINTS_MARKER)) {
                 refreshParameterFieldsForAllSelected();
@@ -695,128 +1444,16 @@ public class FtcFieldSimulatorApp extends Application {
         if (isCreatingPath) {
             controlPanel.setPointEditingControlsDisabled(true);
         }
-    }
 
-    private void handleSendPathToRobot() {
-        if (currentPath.isEmpty()) {
-            instructionLabel.setText("No path to send.");
-            return;
-        }
-
-        String robotIpAddress = controlPanel.getSelectedIpAddress();
-        if (robotIpAddress == null || robotIpAddress.trim().isEmpty()) {
-            instructionLabel.setText("No Robot IP Address selected!");
-            return;
-        }
-
-        instructionLabel.setText("Sending path to robot...");
-        try (DatagramSocket socket = new DatagramSocket()) {
-            InetAddress address = InetAddress.getByName(robotIpAddress);
-            double followAngle;
-            try {
-                followAngle = Double.parseDouble(controlPanel.getFollowAngleField().getText());
-                String followAngleMessage = String.format(Locale.US, "follow_angle:%.2f", followAngle);
-                byte[] followAngleBuffer = followAngleMessage.getBytes(StandardCharsets.UTF_8);
-                DatagramPacket followAnglePacket = new DatagramPacket(followAngleBuffer, followAngleBuffer.length, address, ROBOT_LISTENER_PORT);
-                socket.send(followAnglePacket);
-            } catch (NumberFormatException e) {
-                instructionLabel.setText("Invalid Follow Angle! Sending Aborted.");
-                return;
-            }
-
-            double startX, startY, startHeading;
-            try {
-                startX = Double.parseDouble(controlPanel.getStartXField().getText());
-                startY = Double.parseDouble(controlPanel.getStartYField().getText());
-                startHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
-            } catch (NumberFormatException e) {
-                instructionLabel.setText("Invalid Start Position fields! Sending Aborted.");
-                return;
-            }
-
-            String startPosMessage = String.format(Locale.US, "start_robot_pos:%.3f,%.3f,%.3f", startX, startY, startHeading);
-            byte[] startPosBuffer = startPosMessage.getBytes(StandardCharsets.UTF_8);
-            DatagramPacket startPosPacket = new DatagramPacket(startPosBuffer, startPosBuffer.length, address, ROBOT_LISTENER_PORT);
-            socket.send(startPosPacket);
-
-            for (CurvePoint point : currentPath) {
-                String message = String.format(Locale.US, "curve_point:%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.2f",
-                        point.x, point.y, point.moveSpeed, point.turnSpeed,
-                        point.followDistance,
-                        point.slowDownTurnRadians, point.slowDownTurnAmount);
-
-                byte[] buffer = message.getBytes(StandardCharsets.UTF_8);
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length, address, ROBOT_LISTENER_PORT);
-                socket.send(packet);
-            }
-
-            String endMessage = "end";
-            byte[] endBuffer = endMessage.getBytes(StandardCharsets.UTF_8);
-            DatagramPacket endPacket = new DatagramPacket(endBuffer, endBuffer.length, address, ROBOT_LISTENER_PORT);
-            socket.send(endPacket);
-            instructionLabel.setText("Path sent successfully to " + robotIpAddress);
-        } catch (IOException e) {
-            instructionLabel.setText("Error sending path: " + e.getMessage());
-            e.printStackTrace();
+        if (selectedPath != null) {
+            controlPanel.getFollowAngleField().setText(selectedPath.followAngle);
+        } else {
+            controlPanel.getFollowAngleField().setText(ControlPanel.DEFAULT_FOLLOW_ANGLE);
         }
     }
 
     private void exportPathToCode() {
-        if (currentPath == null || currentPath.isEmpty()) {
-            instructionLabel.setText("No path to export.");
-            Alert alert = new Alert(Alert.AlertType.INFORMATION);
-            alert.setTitle("Export Code");
-            alert.setHeaderText(null);
-            alert.setContentText("There is no path to export. Please create a path first.");
-            alert.showAndWait();
-            return;
-        }
-
-        StringBuilder codeBuilder = new StringBuilder();
-        try {
-            double followAngleDeg = Double.parseDouble(controlPanel.getFollowAngleField().getText());
-            double startX = Double.parseDouble(controlPanel.getStartXField().getText());
-            double startY = Double.parseDouble(controlPanel.getStartYField().getText());
-            double startHeading = Double.parseDouble(controlPanel.getStartHeadingField().getText());
-
-            double allianceMultiplier = isRedAlliance ? -1.0 : 1.0;
-
-            codeBuilder.append("// Code generated by FTC Field Simulator\n\n");
-            codeBuilder.append("// 1. Set the robot's starting position on the field\n");
-            double exportStartY = startY * allianceMultiplier;
-            codeBuilder.append(String.format(Locale.US, "drivetrain.setPosition(new Pose2D(DistanceUnit.INCH, %.2f, y(%.2f), AngleUnit.DEGREES, %.2f));\n\n", startX, exportStartY, startHeading));
-
-            codeBuilder.append("// 2. Define the path waypoints\n");
-            codeBuilder.append("ArrayList<CurvePoint> pathToFollow = new ArrayList<>();\n");
-
-            for (CurvePoint point : currentPath) {
-                double exportY = point.y * allianceMultiplier;
-                codeBuilder.append(String.format(Locale.US,
-                        "pathToFollow.add(new CurvePoint(%.2f, y(%.2f), %.2f, %.2f, %.2f, Math.toRadians(%.1f), %.2f));\n",
-                        point.x, exportY,
-                        point.moveSpeed, point.turnSpeed,
-                        point.followDistance,
-                        Math.toDegrees(point.slowDownTurnRadians),
-                        point.slowDownTurnAmount
-                ));
-            }
-            codeBuilder.append("\n");
-
-            codeBuilder.append("// 3. Create and add the command to the scheduler\n");
-            codeBuilder.append(String.format(Locale.US, "scheduler.add(new FollowPathCommand(pathToFollow, Math.toRadians(%.1f), true));\n", followAngleDeg));
-
-        } catch (NumberFormatException e) {
-            instructionLabel.setText("Invalid parameters in UI fields! Could not generate code.");
-            Alert alert = new Alert(Alert.AlertType.ERROR);
-            alert.setTitle("Export Error");
-            alert.setHeaderText("Invalid Number Format");
-            alert.setContentText("Could not generate code because one of the path parameter fields (like Follow Angle or Start Position) contains invalid text.");
-            alert.showAndWait();
-            return;
-        }
-
-        showCodePopup(codeBuilder.toString());
-        instructionLabel.setText("Code generated with y() wrapping. See popup window to copy.");
+        exportMissionToCode();
     }
 
     private void showCodePopup(String code) {
@@ -842,31 +1479,41 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void deleteCurrentPath() {
-        currentPath.clear();
+        if (selectedPath == null) return;
+        allPaths.remove(selectedPath);
+        if (!allPaths.isEmpty()) {
+            selectedPath = allPaths.get(allPaths.size() - 1);
+        } else {
+            selectedPath = null;
+        }
         isCreatingPath = false;
         fieldDisplay.setPathCreationMode(false, null, () -> finishPathCreation(false));
-        fieldDisplay.setPathToDraw(currentPath);
+        fieldDisplay.setPathsToDraw(allPaths, selectedPath);
         fieldDisplay.drawCurrentState();
         fieldDisplay.setHighlightedPoint(null);
-        instructionLabel.setText("Path deleted. Click 'New Path' to start drawing.");
+        instructionLabel.setText("Path deleted. Select another or click 'New Path'.");
         updateControlPanelForPathState();
+        updateMissionScriptFromState();
     }
 
     private void finishPathCreation(boolean cancelled) {
-        if (!isCreatingPath) return;
+        if (!isCreatingPath || selectedPath == null) return;
+        
+        // Change state BEFORE calling updateControlPanelForPathState to avoid guard loops
         isCreatingPath = false;
         fieldDisplay.setPathCreationMode(false, null, null);
 
-        if (cancelled && currentPath != null) {
-            currentPath.clear();
-            instructionLabel.setText("Path creation cancelled. Click 'New Path' to start again.");
+        if (cancelled && selectedPath.points.isEmpty()) {
+            allPaths.remove(selectedPath);
+            selectedPath = allPaths.isEmpty() ? null : allPaths.get(allPaths.size() - 1);
+            instructionLabel.setText("Path creation cancelled.");
         } else {
-            if (currentPath == null || currentPath.isEmpty()) {
-                instructionLabel.setText("Path finished with no points. Click 'New Path' to start again.");
-                if (currentPath != null) currentPath.clear();
-                else currentPath = new ArrayList<>();
+            if (selectedPath.points.isEmpty()) {
+                instructionLabel.setText("Path finished with no points.");
+                allPaths.remove(selectedPath);
+                selectedPath = allPaths.isEmpty() ? null : allPaths.get(allPaths.size() - 1);
             } else {
-                instructionLabel.setText("Path finished with " + currentPath.size() + " points. Select points to edit parameters.");
+                instructionLabel.setText("Path '" + selectedPath.name + "' finished with " + selectedPath.points.size() + " points.");
             }
         }
 
@@ -875,27 +1522,39 @@ public class FtcFieldSimulatorApp extends Application {
         }
 
         updateControlPanelForPathState();
+        updateMissionScriptFromState();
 
-        if (fieldDisplay != null && currentPath != null) {
-            fieldDisplay.setPathToDraw(currentPath);
+        if (fieldDisplay != null) {
+            fieldDisplay.setPathsToDraw(allPaths, selectedPath);
             fieldDisplay.drawCurrentState();
         }
     }
 
     private void handleFieldClickForPath(Point2D pixelCoords) {
-        if (!isCreatingPath || controlPanel == null) return;
+        if (!isCreatingPath || controlPanel == null || selectedPath == null) return;
 
         Point2D inchesCoordsFieldCenter = fieldDisplay.pixelToInches(pixelCoords.getX(), pixelCoords.getY());
         double fieldX = inchesCoordsFieldCenter.getX();
         double fieldY = inchesCoordsFieldCenter.getY();
 
-        if (currentPath.isEmpty()) {
-            double startHeading = 0.0;
-            robot.setPosition(fieldX, fieldY, startHeading);
-            if (controlPanel != null) {
+        // Chaining logic: ensure path sequence continuity
+        if (selectedPath.points.isEmpty()) {
+            int pathIndex = allPaths.indexOf(selectedPath);
+            if (pathIndex > 0) {
+                PathData prevPath = allPaths.get(pathIndex - 1);
+                if (!prevPath.points.isEmpty()) {
+                    CurvePoint lastPointOfPrev = prevPath.points.getLast();
+                    // The first point of a new path is always the last point of the previous path
+                    CurvePoint firstPoint = new CurvePoint(lastPointOfPrev);
+                    selectedPath.points.add(firstPoint);
+                }
+            } else {
+                // First path in the sequence starts at the robot's initial position
+                double startHeading = 0.0;
+                robot.setPosition(fieldX, fieldY, startHeading);
                 controlPanel.updateRobotStartFields(fieldX, fieldY, startHeading);
+                updateUIFromRobotState();
             }
-            updateUIFromRobotState();
         }
 
         double moveSpeed, turnSpeed, followDistance, slowDownTurnDeg, slowDownTurnAmount, slowDownTurnRad;
@@ -906,7 +1565,7 @@ public class FtcFieldSimulatorApp extends Application {
             slowDownTurnDeg = controlPanel.getSlowDownTurnDegreesParam();
             slowDownTurnAmount = controlPanel.getSlowDownTurnAmountParam();
             if (moveSpeed <= 0 || turnSpeed <= 0 || followDistance < 0 || slowDownTurnAmount < 0 || slowDownTurnAmount > 1) {
-                throw new NumberFormatException("Default parameter out of typical range.");
+                throw new NumberFormatException("Default parameter out of range.");
             }
             slowDownTurnRad = Math.toRadians(slowDownTurnDeg);
         } catch (NumberFormatException e) {
@@ -918,15 +1577,15 @@ public class FtcFieldSimulatorApp extends Application {
         }
 
         CurvePoint newPoint = new CurvePoint(fieldX, fieldY, moveSpeed, turnSpeed, followDistance, slowDownTurnRad, slowDownTurnAmount);
-        currentPath.add(newPoint);
-        fieldDisplay.setPathToDraw(currentPath);
+        selectedPath.points.add(newPoint);
+        
+        // Refresh the display with current state
+        fieldDisplay.setPathsToDraw(allPaths, selectedPath);
         fieldDisplay.drawCurrentState();
+        updateMissionScriptFromState();
 
-        if (currentPath.size() == 1) {
-            instructionLabel.setText("Point 1 added. Click next waypoint. ESC to cancel.");
-        } else {
-            instructionLabel.setText("Point " + currentPath.size() + " added. Click next, Double-click last, or ESC to cancel.");
-        }
+        instructionLabel.setText(String.format(Locale.US, "Added Point %d to %s. Click next, double-click to finish.", 
+                selectedPath.points.size(), selectedPath.name));
     }
 
     private void updateTimeLapsedDisplay() {
@@ -936,21 +1595,31 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void startNewPathCreation() {
-        if (isCreatingPath) return;
-        if (currentPath == null) currentPath = new ArrayList<>();
-        currentPath.clear();
+        if (isCreatingPath) {
+            finishPathCreation(false);
+        }
+
+        // Create new path object
+        PathData newPath = new PathData("Path " + (allPaths.size() + 1));
+        allPaths.add(newPath);
+        selectedPath = newPath;
         isCreatingPath = true;
+        
         fieldDisplay.setHighlightedPoint(null);
 
         if (controlPanel != null) {
             controlPanel.setPathEditingActive(true);
         }
 
+        // Update UI components
         updateControlPanelForPathState();
-        instructionLabel.setText("Click the first waypoint. Parameters from global defaults will be used.");
+        updateMissionScriptFromState();
+        
+        instructionLabel.setText("Creating " + newPath.name + ". Click waypoints on the field.");
         if (fieldDisplay != null) {
+            // Ensure display knows about the new selected path
+            fieldDisplay.setPathsToDraw(allPaths, selectedPath);
             fieldDisplay.setPathCreationMode(true, this::handleFieldClickForPath, () -> finishPathCreation(false));
-            fieldDisplay.setPathToDraw(currentPath);
             fieldDisplay.drawCurrentState();
         }
     }
