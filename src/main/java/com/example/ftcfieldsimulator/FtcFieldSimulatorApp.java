@@ -291,7 +291,7 @@ public class FtcFieldSimulatorApp extends Application {
         double hField = parseHeadingExpression(path.followAngle, isRedAlliance);
 
         // Update header string (in case name or heading changed)
-        missionSteps.get(headerIdx).updatePathHeader(path.name, hField, "IMMEDIATE");
+        missionSteps.get(headerIdx).updatePathHeader(path.name, hField, "END");
 
         // Remove old points for this path
         int idx = headerIdx + 1;
@@ -311,7 +311,7 @@ public class FtcFieldSimulatorApp extends Application {
     private void appendPathToSteps(PathData path) {
         // Add at the end
         missionSteps.add(new AutonomousStep(AutonomousStep.Type.EMPTY, ""));
-        AutonomousStep header = AutonomousStep.pathHeader(path.name, path.followAngle, "IMMEDIATE");
+        AutonomousStep header = AutonomousStep.pathHeader(path.name, path.followAngle, "END");
         header.pathRef = path;
         missionSteps.add(header);
         for (CurvePoint p : path.points) {
@@ -690,7 +690,7 @@ public class FtcFieldSimulatorApp extends Application {
             hintArea.setText(
                 "# Quick Reference (Copy & Paste templates):\n" +
                 "CMD: SetInitialPoseCommand | args=[-62.04, y(14.00), 0.00] | name=\"Start\"\n" +
-                "PATH: name=\"Drive to Shoot\" | heading=90.0 | transition=IMMEDIATE\n" +
+                "PATH: name=\"Drive to Shoot\" | heading=90.0 | transition=END\n" +
                 "P: -60.0, 10.0, 1.0, 0.4, 10.0, 60.0, 0.60\n" +
                 "WAIT: 1.5\n" +
                 "CMD: Shoot3BallsCommand | args=[] | name=\"Action Name\""
@@ -830,7 +830,7 @@ public class FtcFieldSimulatorApp extends Application {
                         Matcher nm = Pattern.compile("\\.withName\\(\"(.*?)\"\\)").matcher(line);
                         if (nm.find()) stepName = nm.group(1);
                         
-                        String trans = "IMMEDIATE";
+                        String trans = "END";
                         // If 4th constructor argument exists, use it as default transition
                         if (fm.group(3) != null) {
                             trans = "DIST(" + fm.group(3).trim() + ")";
@@ -1026,7 +1026,7 @@ public class FtcFieldSimulatorApp extends Application {
                 if (line.startsWith("PATH:")) {
                     String name = "Path " + pathCount;
                     String hExpr = "0.0";
-                    String trans = "IMMEDIATE";
+                    String trans = "END";
                     
                     Matcher m = Pattern.compile("name=\"(.*?)\"").matcher(line);
                     if (m.find()) name = m.group(1);
