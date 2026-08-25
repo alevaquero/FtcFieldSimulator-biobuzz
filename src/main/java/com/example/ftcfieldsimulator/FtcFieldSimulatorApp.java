@@ -387,6 +387,8 @@ public class FtcFieldSimulatorApp extends Application {
 
         if (forceSnap && selectedPath != null) {
             snapRobotToPath(selectedPath);
+        } else if (selectedPath != null) {
+            updateRobotHeadingIfAtWaypoint(selectedPath);
         }
 
         if (fieldDisplay != null) {
@@ -511,26 +513,18 @@ public class FtcFieldSimulatorApp extends Application {
     }
 
     private void snapRobotToPath(PathData path) {
-        if (path == null || path.points.isEmpty()) return;
+        snapRobotToPoint(path, 0);
+    }
 
-        CurvePoint p1 = path.points.get(0);
-        double targetHeading = robot.getHeadingDegrees();
+    private void snapRobotToPoint(PathData path, int pointIndex) {
+        if (path == null || path.points.isEmpty() || pointIndex < 0 || pointIndex >= path.points.size()) return;
 
-        if (path.points.size() > 1) {
-            CurvePoint p2 = path.points.get(1);
-            double dx = p2.x - p1.x;
-            double dy = p2.y - p1.y;
-            // Angle in degrees from p1 to p2 (direction of path travel)
-            double pathDirectionDeg = Math.toDegrees(Math.atan2(dy, dx));
+        CurvePoint cp = path.points.get(pointIndex);
+        double pathDirectionDeg = getPathDirectionAtPoint(path, pointIndex);
+        double followAngleValue = parseHeadingExpression(path.followAngle, isRedAlliance);
+        double targetHeading = pathDirectionDeg + (followAngleValue - 90.0);
 
-            // Parse follow angle (relative to path direction)
-            double followAngleValue = parseHeadingExpression(path.followAngle, isRedAlliance);
-
-            // Robot heading = path direction + offset from "forward" (which is 90 degrees)
-            targetHeading = pathDirectionDeg + (followAngleValue - 90.0);
-        }
-
-        robot.setPosition(p1.x, p1.y, targetHeading);
+        robot.setPosition(cp.x, cp.y, targetHeading);
         updateUIFromRobotState();
     }
 
@@ -553,6 +547,53 @@ public class FtcFieldSimulatorApp extends Application {
             PathData nextPath = allPaths.get(nextIndex);
             // Setting the value on the ComboBox triggers handlePathSelectionChanged
             controlPanel.getPathSelectionComboBox().setValue(nextPath);
+        }
+    }
+
+    private void navigatePoints(int offset) {
+        if (allPaths.isEmpty() || isCreatingPath) return;
+        if (selectedPath == null) {
+            selectedPath = allPaths.get(0);
+        }
+
+        Object currentSelection = controlPanel.getSelectedPointFromComboBox();
+        int currentIndex = -1; // -1 represents ALL_POINTS_MARKER
+        if (currentSelection instanceof CurvePoint) {
+            currentIndex = selectedPath.points.indexOf(currentSelection);
+        }
+
+        if (offset > 0) { // Next
+            if (currentIndex < selectedPath.points.size() - 1) {
+                // Next point in same path
+                controlPanel.getPointSelectionComboBox().setValue(selectedPath.points.get(currentIndex + 1));
+            } else {
+                // Go to next path, first point
+                int pathIdx = allPaths.indexOf(selectedPath);
+                if (pathIdx < allPaths.size() - 1) {
+                    PathData nextPath = allPaths.get(pathIdx + 1);
+                    if (!nextPath.points.isEmpty()) {
+                        // Change path and explicitly select first point
+                        controlPanel.getPathSelectionComboBox().setValue(nextPath);
+                        controlPanel.getPointSelectionComboBox().setValue(nextPath.points.get(0));
+                    }
+                }
+            }
+        } else if (offset < 0) { // Previous
+            if (currentIndex > 0) {
+                // Previous point in same path
+                controlPanel.getPointSelectionComboBox().setValue(selectedPath.points.get(currentIndex - 1));
+            } else if (currentIndex == 0 || currentIndex == -1) {
+                // At P1 or ALL, go to previous path, last point
+                int pathIdx = allPaths.indexOf(selectedPath);
+                if (pathIdx > 0) {
+                    PathData prevPath = allPaths.get(pathIdx - 1);
+                    if (!prevPath.points.isEmpty()) {
+                        // Change path and explicitly select last point
+                        controlPanel.getPathSelectionComboBox().setValue(prevPath);
+                        controlPanel.getPointSelectionComboBox().setValue(prevPath.points.get(prevPath.points.size() - 1));
+                    }
+                }
+            }
         }
     }
 
@@ -712,6 +753,8 @@ public class FtcFieldSimulatorApp extends Application {
             instructionLabel.setText("All custom lines cleared.");
         });
         controlPanel.setOnPointSelectionAction(this::handlePointSelectionChanged);
+        controlPanel.setOnPrevPointAction(event -> navigatePoints(-1));
+        controlPanel.setOnNextPointAction(event -> navigatePoints(1));
         controlPanel.setOnShowPlotAction(event -> showPlotDisplay());
     }
 
@@ -1317,10 +1360,47 @@ public class FtcFieldSimulatorApp extends Application {
         if (!text.isEmpty()) {
             selectedPath.followAngle = text;
             instructionLabel.setText("Follow angle updated for " + selectedPath.name);
+            updateRobotHeadingIfAtWaypoint(selectedPath);
             updateMissionScriptFromState();
         } else {
             controlPanel.getFollowAngleField().setText(selectedPath.followAngle);
         }
+    }
+
+    private void updateRobotHeadingIfAtWaypoint(PathData path) {
+        if (path == null || path.points.isEmpty()) return;
+
+        double robotX = robot.getXInches();
+        double robotY = robot.getYInches();
+
+        for (int i = 0; i < path.points.size(); i++) {
+            CurvePoint cp = path.points.get(i);
+            if (Math.abs(cp.x - robotX) < 1e-2 && Math.abs(cp.y - robotY) < 1e-2) {
+                double pathDir = getPathDirectionAtPoint(path, i);
+                double followAngleValue = parseHeadingExpression(path.followAngle, isRedAlliance);
+                double targetHeading = pathDir + (followAngleValue - 90.0);
+                robot.setHeading(targetHeading);
+                updateUIFromRobotState();
+                break;
+            }
+        }
+    }
+
+    private double getPathDirectionAtPoint(PathData path, int pointIndex) {
+        if (path.points.size() < 2) return robot.getHeadingDegrees();
+
+        CurvePoint p1, p2;
+        if (pointIndex < path.points.size() - 1) {
+            p1 = path.points.get(pointIndex);
+            p2 = path.points.get(pointIndex + 1);
+        } else {
+            p1 = path.points.get(pointIndex - 1);
+            p2 = path.points.get(pointIndex);
+        }
+
+        double dx = p2.x - p1.x;
+        double dy = p2.y - p1.y;
+        return Math.toDegrees(Math.atan2(dy, dx));
     }
 
     private void handleRobotStartFieldFocusLost() {
@@ -1458,6 +1538,10 @@ public class FtcFieldSimulatorApp extends Application {
             CurvePoint selectedCurvePoint = (CurvePoint) newVal;
             controlPanel.loadParametersForPoint(selectedCurvePoint);
             pointToHighlight = selectedCurvePoint;
+            
+            // Move robot to the selected point
+            int pointIndex = selectedPath.points.indexOf(selectedCurvePoint);
+            snapRobotToPoint(selectedPath, pointIndex);
         }
 
         if (fieldDisplay != null) {

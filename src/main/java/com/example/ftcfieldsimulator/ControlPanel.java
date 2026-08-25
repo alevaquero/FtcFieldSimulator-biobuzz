@@ -61,6 +61,7 @@ public class ControlPanel extends VBox {
 
     // --- Path Point Parameter UI Elements ---
     private TextField followAngleField; // NEW
+    private Button prevPointButton, nextPointButton; // Point navigation buttons
     private ComboBox<Object> pointSelectionComboBox;
     private TextField moveSpeedField, turnSpeedField, followDistanceField, slowDownTurnDegreesField, slowDownTurnAmountField;
     private List<TextField> paramTextFieldsList;
@@ -193,9 +194,15 @@ public class ControlPanel extends VBox {
         pointSelectionComboBox.setMaxWidth(Double.MAX_VALUE);
         configurePointSelectionComboBoxCellFactory();
 
+        prevPointButton = new Button("<");
+        nextPointButton = new Button(">");
+        HBox pointNavBox = new HBox(5, prevPointButton, pointSelectionComboBox, nextPointButton);
+        pointNavBox.setAlignment(Pos.CENTER_LEFT);
+        HBox.setHgrow(pointSelectionComboBox, Priority.ALWAYS);
+
         // --- SPACING CHANGE 4 (continued): Reduced GridPane vgap from 8 to 6 ---
         GridPane paramsGrid = createParametersGrid(6);
-        VBox curveParamsBox = new VBox(SECTION_SPACING, paramsTitle, followAngleGrid, pointSelectionComboBox, paramsGrid);
+        VBox curveParamsBox = new VBox(SECTION_SPACING, paramsTitle, followAngleGrid, pointNavBox, paramsGrid);
 
         // --- Utility Controls Section ---
         Label utilityTitle = new Label("Utilities");
@@ -522,6 +529,8 @@ public class ControlPanel extends VBox {
 
     public void setPointEditingControlsDisabled(boolean disabled) {
         pointSelectionComboBox.setDisable(disabled);
+        prevPointButton.setDisable(disabled);
+        nextPointButton.setDisable(disabled);
         for (TextField tf : paramTextFieldsList) {
             tf.setDisable(disabled);
         }
@@ -602,6 +611,9 @@ public class ControlPanel extends VBox {
     public void setOnPointSelectionAction(ChangeListener<Object> listener) {
         pointSelectionComboBox.valueProperty().addListener(listener);
     }
+
+    public void setOnPrevPointAction(EventHandler<ActionEvent> handler) { prevPointButton.setOnAction(handler); }
+    public void setOnNextPointAction(EventHandler<ActionEvent> handler) { nextPointButton.setOnAction(handler); }
 
     public void setOnPathSelectionAction(ChangeListener<PathData> listener) {
         pathSelectionComboBox.valueProperty().addListener(listener);
