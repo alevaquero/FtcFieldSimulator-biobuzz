@@ -730,7 +730,7 @@ public class FieldDisplay extends Pane {
                     gc.setLineWidth(3);
                 } else {
                     gc.setStroke(Color.GRAY.deriveColor(0, 1, 1, 0.4));
-                    gc.setLineWidth(1.5);
+                    gc.setLineWidth(3);
                 }
 
                 if (points.size() > 1) {
@@ -745,9 +745,9 @@ public class FieldDisplay extends Pane {
                                 gc.setLineWidth(3);
                             }
                         } else {
-                            // Inactive paths drawn as thin gray lines
+                            // Inactive paths drawn as gray lines
                             gc.setStroke(Color.GRAY.deriveColor(0, 1, 1, 0.5));
-                            gc.setLineWidth(1.5);
+                            gc.setLineWidth(3);
                         }
 
                         CurvePoint p1 = points.get(i);
@@ -761,11 +761,15 @@ public class FieldDisplay extends Pane {
                 if (isActive) {
                     gc.setStroke(Color.BLACK);
                     gc.setLineWidth(1);
-                    for (CurvePoint p : points) {
+                    int totalPoints = points.size();
+                    for (int i = 0; i < totalPoints; i++) {
+                        CurvePoint p = points.get(i);
                         double canvasX = fieldYtoCanvasX(p.y);
                         double canvasY = fieldXtoCanvasY(p.x);
                         double pointSize = 8.0;
-                        Color pointColor = Color.RED;
+
+                        // Requirement 1: Solid Color ORANGE
+                        Color pointColor = Color.ORANGE;
 
                         if (p == draggedPoint) {
                             pointSize = 12.0;
@@ -780,14 +784,57 @@ public class FieldDisplay extends Pane {
 
                         gc.setFill(pointColor);
                         gc.fillOval(canvasX - pointSize / 2, canvasY - pointSize / 2, pointSize, pointSize);
+
+                        // Requirement 2 & 4: Alphabetical labels (A, B... Z, A1, B1...)
+                        int quotient = i / 26;
+                        int remainder = i % 26;
+                        String label = "" + (char) ('A' + remainder) + (quotient > 0 ? quotient : "");
+
+                        // Requirement 3: Position labels using normal vector to the path
+                        double dx, dy;
+                        if (totalPoints == 1) {
+                            dx = 1; dy = 0;
+                        } else if (i == 0) {
+                            dx = fieldYtoCanvasX(points.get(1).y) - canvasX;
+                            dy = fieldXtoCanvasY(points.get(1).x) - canvasY;
+                        } else if (i == totalPoints - 1) {
+                            dx = canvasX - fieldYtoCanvasX(points.get(i - 1).y);
+                            dy = canvasY - fieldXtoCanvasY(points.get(i - 1).x);
+                        } else {
+                            dx = fieldYtoCanvasX(points.get(i + 1).y) - fieldYtoCanvasX(points.get(i - 1).y);
+                            dy = fieldXtoCanvasY(points.get(i + 1).x) - fieldXtoCanvasY(points.get(i - 1).x);
+                        }
+
+                        double len = Math.sqrt(dx * dx + dy * dy);
+                        double nx, ny;
+                        if (len < 1e-6) {
+                            nx = 0; ny = -1;
+                        } else {
+                            nx = -dy / len;
+                            ny = dx / len;
+                        }
+
+                        double offset = 18.0; // Offset distance from point center
+                        double labelX = canvasX + nx * offset;
+                        double labelY = canvasY + ny * offset;
+
+                        // Requirement 5: Font bold Arial 12, White color
+                        gc.save();
+                        gc.setFont(Font.font("Arial", FontWeight.BOLD, 12));
+                        gc.setFill(Color.WHITE);
+                        gc.setTextAlign(TextAlignment.CENTER);
+                        gc.setTextBaseline(VPos.CENTER);
+                        gc.fillText(label, labelX, labelY);
+                        gc.restore();
                     }
                 } else {
-                    // Small dots for inactive paths
+                    // Waypoints for inactive paths
                     gc.setFill(Color.GRAY.deriveColor(0, 1, 1, 0.6));
+                    double pointSize = 8.0;
                     for (CurvePoint p : points) {
                         double canvasX = fieldYtoCanvasX(p.y);
                         double canvasY = fieldXtoCanvasY(p.x);
-                        gc.fillOval(canvasX - 2.5, canvasY - 2.5, 5, 5);
+                        gc.fillOval(canvasX - pointSize / 2, canvasY - pointSize / 2, pointSize, pointSize);
                     }
                 }
             }

@@ -22,6 +22,7 @@ import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import javafx.scene.control.Alert;
 import javafx.scene.control.TextArea;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.Region;
 import javafx.scene.text.Font;
@@ -376,10 +377,16 @@ public class FtcFieldSimulatorApp extends Application {
             handleRobotStartFieldFocusLost();
         }
 
+        boolean forceSnap = (selectedPath == null);
         if (selectedPath == null && !allPaths.isEmpty()) {
             selectedPath = allPaths.get(0);
         } else if (!allPaths.contains(selectedPath)) {
             selectedPath = allPaths.isEmpty() ? null : allPaths.get(allPaths.size() - 1);
+            forceSnap = true;
+        }
+
+        if (forceSnap && selectedPath != null) {
+            snapRobotToPath(selectedPath);
         }
 
         if (fieldDisplay != null) {
@@ -492,10 +499,60 @@ public class FtcFieldSimulatorApp extends Application {
             // Update follow angle field for the new selected path
             controlPanel.getFollowAngleField().setText(selectedPath.followAngle);
             updateControlPanelForPathState();
+
+            // Snap robot to the start of the selected path
+            snapRobotToPath(selectedPath);
+
             if (fieldDisplay != null) {
                 fieldDisplay.setPathsToDraw(allPaths, selectedPath);
                 fieldDisplay.drawCurrentState();
             }
+        }
+    }
+
+    private void snapRobotToPath(PathData path) {
+        if (path == null || path.points.isEmpty()) return;
+
+        CurvePoint p1 = path.points.get(0);
+        double targetHeading = robot.getHeadingDegrees();
+
+        if (path.points.size() > 1) {
+            CurvePoint p2 = path.points.get(1);
+            double dx = p2.x - p1.x;
+            double dy = p2.y - p1.y;
+            // Angle in degrees from p1 to p2 (direction of path travel)
+            double pathDirectionDeg = Math.toDegrees(Math.atan2(dy, dx));
+
+            // Parse follow angle (relative to path direction)
+            double followAngleValue = parseHeadingExpression(path.followAngle, isRedAlliance);
+
+            // Robot heading = path direction + offset from "forward" (which is 90 degrees)
+            targetHeading = pathDirectionDeg + (followAngleValue - 90.0);
+        }
+
+        robot.setPosition(p1.x, p1.y, targetHeading);
+        updateUIFromRobotState();
+    }
+
+    private void navigatePaths(int offset) {
+        if (allPaths.isEmpty() || isCreatingPath) return;
+        
+        // Find current index by instance, or by name if instances changed (e.g. script update)
+        int currentIndex = allPaths.indexOf(selectedPath);
+        if (currentIndex == -1 && selectedPath != null) {
+            for (int i = 0; i < allPaths.size(); i++) {
+                if (allPaths.get(i).name.equals(selectedPath.name)) {
+                    currentIndex = i;
+                    break;
+                }
+            }
+        }
+        
+        int nextIndex = currentIndex + offset;
+        if (nextIndex >= 0 && nextIndex < allPaths.size()) {
+            PathData nextPath = allPaths.get(nextIndex);
+            // Setting the value on the ComboBox triggers handlePathSelectionChanged
+            controlPanel.getPathSelectionComboBox().setValue(nextPath);
         }
     }
 
@@ -604,7 +661,7 @@ public class FtcFieldSimulatorApp extends Application {
                 fieldStatusDisplay.updateRobotStatus(robot.getXInches(), robot.getYInches(), displayHeading);
             }
 
-            if (controlPanel != null && (
+            if (controlPanel != null && !(
                     controlPanel.getStartXField().isFocused() ||
                             controlPanel.getStartYField().isFocused() ||
                             controlPanel.getStartHeadingField().isFocused()
@@ -638,6 +695,8 @@ public class FtcFieldSimulatorApp extends Application {
     private void setupControlPanelActions(Stage ownerStage) {
         controlPanel.setOnNewPathAction(event -> startNewPathCreation());
         controlPanel.setOnDeletePathAction(event -> deleteCurrentPath());
+        controlPanel.setOnPrevPathAction(event -> navigatePaths(-1));
+        controlPanel.setOnNextPathAction(event -> navigatePaths(1));
         controlPanel.setOnPathSelectionAction(this::handlePathSelectionChanged);
         controlPanel.setOnImportCodeAction(event -> showImportMissionDialog());
         controlPanel.setOnExportCodeAction(event -> exportMissionToCode());
@@ -674,13 +733,69 @@ public class FtcFieldSimulatorApp extends Application {
             popupScriptArea = new TextArea(controlPanel.getMissionScript());
             popupScriptArea.setFont(Font.font("Consolas", 14));
             popupScriptArea.setPrefSize(800, 600);
+            popupScriptArea.setWrapText(false); // Line numbers only work well without wrapping
+
+            // Line numbers gutter
+            TextArea lineNumbersArea = new TextArea("1");
+            lineNumbersArea.setFont(Font.font("Consolas", 14));
+            lineNumbersArea.setEditable(false);
+            lineNumbersArea.setFocusTraversable(false);
+            lineNumbersArea.setPrefWidth(50);
+            lineNumbersArea.setMinWidth(50);
+            lineNumbersArea.setMaxWidth(50);
+            // Prevent scroll bar from appearing on gutter and make it non-interactive
+            lineNumbersArea.setStyle("-fx-background-color: #EEE; -fx-text-fill: #888; -fx-opacity: 1.0; -fx-control-inner-background: #EEE;");
+            lineNumbersArea.setMouseTransparent(true);
+
+            // Hide scrollbars specifically for the gutter
+            lineNumbersArea.skinProperty().addListener((obs, oldSkin, newSkin) -> {
+                if (newSkin != null) {
+                    ScrollPane sp = (ScrollPane) lineNumbersArea.lookup(".scroll-pane");
+                    if (sp != null) {
+                        sp.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+                        sp.setVbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+                    }
+                }
+            });
+
+            // Hide horizontal scrollbar for the main editor as requested
+            popupScriptArea.skinProperty().addListener((obs, oldSkin, newSkin) -> {
+                if (newSkin != null) {
+                    ScrollPane sp = (ScrollPane) popupScriptArea.lookup(".scroll-pane");
+                    if (sp != null) {
+                        sp.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+                    }
+                }
+            });
+
+            Runnable updateLineNumbers = () -> {
+                int lineCount = popupScriptArea.getText().split("\n", -1).length;
+                StringBuilder sb = new StringBuilder();
+                for (int i = 1; i <= lineCount; i++) {
+                    sb.append(i).append("\n");
+                }
+                lineNumbersArea.setText(sb.toString().trim());
+                // After setting text, force scroll sync
+                lineNumbersArea.setScrollTop(popupScriptArea.getScrollTop());
+            };
 
             // Sync: Popup -> ControlPanel (which then syncs to state)
             popupScriptArea.textProperty().addListener((obs, oldVal, newVal) -> {
                 if (popupScriptArea.isFocused()) {
                     controlPanel.setMissionScript(newVal);
                 }
+                updateLineNumbers.run();
             });
+
+            // Very hacky sync of scrollbars in standard JavaFX
+            popupScriptArea.scrollTopProperty().addListener((obs, oldVal, newVal) -> {
+                lineNumbersArea.setScrollTop(newVal.doubleValue());
+            });
+
+            updateLineNumbers.run();
+
+            HBox editorBox = new HBox(lineNumbersArea, popupScriptArea);
+            HBox.setHgrow(popupScriptArea, Priority.ALWAYS);
 
             // Hint section
             TextArea hintArea = new TextArea();
@@ -697,8 +812,8 @@ public class FtcFieldSimulatorApp extends Application {
             );
             hintArea.setStyle("-fx-control-inner-background: #F5F5F5; -fx-text-fill: #555;");
 
-            VBox root = new VBox(10, new Label("Edit Mission Script:"), popupScriptArea, new Label("Available Step Formats:"), hintArea);
-            VBox.setVgrow(popupScriptArea, Priority.ALWAYS);
+            VBox root = new VBox(10, new Label("Edit Mission Script:"), editorBox, new Label("Available Step Formats:"), hintArea);
+            VBox.setVgrow(editorBox, Priority.ALWAYS);
             root.setPadding(new Insets(10));
 
             Scene scene = new Scene(root, 900, 800);
@@ -747,8 +862,9 @@ public class FtcFieldSimulatorApp extends Application {
         result.ifPresent(res -> {
             this.isRedAlliance = res.isRed;
             String missionScript = parseJavaToMission(res.code, res.isRed);
+            this.selectedPath = null; // Ensure the first path of the new mission is selected
             controlPanel.setMissionScript(missionScript);
-            updateStateFromMissionScript(missionScript);
+            // updateStateFromMissionScript(missionScript); // This is already triggered by setMissionScript listener
         });
     }
 

@@ -38,6 +38,7 @@ public class ControlPanel extends VBox {
 
     // --- UI Elements ---
     private Button newPathButton, deletePathButton, importCodeButton, exportCodeButton, clearTrailButton, clearNamedLinesButton;
+    private Button prevPathButton, nextPathButton; // Path navigation buttons
     private Button editMissionButton; // New button for mission script popup
     private ComboBox<PathData> pathSelectionComboBox; // Multi-path support
     private TextArea missionScriptArea; // Mission Script Support (stored here, edited in popup)
@@ -100,6 +101,12 @@ public class ControlPanel extends VBox {
         pathSelectionComboBox.setPromptText("Select Path");
         pathSelectionComboBox.setMaxWidth(Double.MAX_VALUE);
 
+        prevPathButton = new Button("<");
+        nextPathButton = new Button(">");
+        HBox pathNavBox = new HBox(5, prevPathButton, pathSelectionComboBox, nextPathButton);
+        pathNavBox.setAlignment(Pos.CENTER_LEFT);
+        HBox.setHgrow(pathSelectionComboBox, Priority.ALWAYS);
+
         newPathButton = createMaxWidthButton("New Path");
         deletePathButton = createMaxWidthButton("Delete Path");
         importCodeButton = createMaxWidthButton("Import Mission");
@@ -128,7 +135,7 @@ public class ControlPanel extends VBox {
         HBox.setHgrow(importCodeButton, Priority.ALWAYS);
         HBox.setHgrow(exportCodeButton, Priority.ALWAYS);
 
-        VBox pathControlsBox = new VBox(SECTION_SPACING, robotTitleBox, pathSelectionComboBox, newDeleteBox, importExportBox, sendPathBox);
+        VBox pathControlsBox = new VBox(SECTION_SPACING, robotTitleBox, pathNavBox, newDeleteBox, importExportBox, sendPathBox);
 
         // --- Mission Script Section ---
         editMissionButton = createMaxWidthButton("Edit Mission Script");
@@ -420,6 +427,8 @@ public class ControlPanel extends VBox {
 
     public void setOnNewPathAction(EventHandler<ActionEvent> handler) { newPathButton.setOnAction(handler); }
     public void setOnDeletePathAction(EventHandler<ActionEvent> handler) { deletePathButton.setOnAction(handler); }
+    public void setOnPrevPathAction(EventHandler<ActionEvent> handler) { prevPathButton.setOnAction(handler); }
+    public void setOnNextPathAction(EventHandler<ActionEvent> handler) { nextPathButton.setOnAction(handler); }
     public void setOnImportCodeAction(EventHandler<ActionEvent> handler) { importCodeButton.setOnAction(handler); }    public void setOnExportCodeAction(EventHandler<ActionEvent> handler) { exportCodeButton.setOnAction(handler); }
     public void setOnEditMissionAction(EventHandler<ActionEvent> handler) { editMissionButton.setOnAction(handler); }
     public void setOnSendMissionAction(EventHandler<ActionEvent> handler) { if (sendMissionButton != null) { sendMissionButton.setOnAction(handler); } }
@@ -447,6 +456,8 @@ public class ControlPanel extends VBox {
     public void setPathEditingActive(boolean isActive) {
         newPathButton.setDisable(isActive);
         deletePathButton.setDisable(isActive || deletePathButton.isDisabled());
+        prevPathButton.setDisable(isActive);
+        nextPathButton.setDisable(isActive);
         importCodeButton.setDisable(isActive); // Disable during path creation
         exportCodeButton.setDisable(isActive || exportCodeButton.isDisabled());
         if (sendMissionButton != null) {
@@ -472,6 +483,8 @@ public class ControlPanel extends VBox {
     public void enablePathControls(boolean pathExists) {
         boolean pathEditingMode = newPathButton.isDisabled();
         deletePathButton.setDisable(!pathExists || pathEditingMode);
+        prevPathButton.setDisable(!pathExists || pathEditingMode);
+        nextPathButton.setDisable(!pathExists || pathEditingMode);
         importCodeButton.setDisable(pathEditingMode);
         exportCodeButton.setDisable(!pathExists || pathEditingMode);
         if (sendMissionButton != null) {
@@ -519,9 +532,27 @@ public class ControlPanel extends VBox {
     public TextArea getMissionScriptArea() { return missionScriptArea; }
 
     public void updatePathSelectionComboBox(List<PathData> paths, PathData pathToSelect) {
-        pathSelectionComboBox.setItems(FXCollections.observableArrayList(paths));
+        // Only update items if they are functionally different to avoid unnecessary selection resets
+        List<PathData> currentItems = pathSelectionComboBox.getItems();
+        boolean itemsChanged = currentItems.size() != paths.size();
+        if (!itemsChanged) {
+            for (int i = 0; i < paths.size(); i++) {
+                if (currentItems.get(i) != paths.get(i)) {
+                    itemsChanged = true;
+                    break;
+                }
+            }
+        }
+
+        if (itemsChanged) {
+            pathSelectionComboBox.setItems(FXCollections.observableArrayList(paths));
+        }
+
         if (pathToSelect != null) {
-            pathSelectionComboBox.setValue(pathToSelect);
+            // Avoid redundant selection changes
+            if (pathSelectionComboBox.getValue() != pathToSelect) {
+                pathSelectionComboBox.setValue(pathToSelect);
+            }
         }
     }
 
@@ -533,15 +564,35 @@ public class ControlPanel extends VBox {
             newItemsForComboBox.addAll(path);
         }
 
-        pointSelectionComboBox.setItems(FXCollections.observableArrayList(newItemsForComboBox));
+        // Only update items if they are functionally different
+        List<Object> currentItems = pointSelectionComboBox.getItems();
+        boolean itemsChanged = currentItems.size() != newItemsForComboBox.size();
+        if (!itemsChanged) {
+            for (int i = 0; i < newItemsForComboBox.size(); i++) {
+                if (currentItems.get(i) != newItemsForComboBox.get(i)) {
+                    itemsChanged = true;
+                    break;
+                }
+            }
+        }
 
-        if (objectToSelect != null && newItemsForComboBox.contains(objectToSelect)) {
-            pointSelectionComboBox.setValue(objectToSelect);
+        if (itemsChanged) {
+            pointSelectionComboBox.setItems(FXCollections.observableArrayList(newItemsForComboBox));
+        }
+
+        if (objectToSelect != null) {
+            if (pointSelectionComboBox.getValue() != objectToSelect) {
+                pointSelectionComboBox.setValue(objectToSelect);
+            }
         } else if (path != null && !path.isEmpty()) {
-            pointSelectionComboBox.setValue(ALL_POINTS_MARKER);
+            if (!ALL_POINTS_MARKER.equals(pointSelectionComboBox.getValue())) {
+                pointSelectionComboBox.setValue(ALL_POINTS_MARKER);
+            }
         } else {
             if (!pointSelectionComboBox.isDisabled()) {
-                pointSelectionComboBox.setValue(ALL_POINTS_MARKER);
+                if (!ALL_POINTS_MARKER.equals(pointSelectionComboBox.getValue())) {
+                    pointSelectionComboBox.setValue(ALL_POINTS_MARKER);
+                }
             } else {
                 pointSelectionComboBox.setValue(null);
             }
