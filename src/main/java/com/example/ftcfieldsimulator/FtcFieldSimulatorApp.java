@@ -405,13 +405,13 @@ public class FtcFieldSimulatorApp extends Application {
         if (p.length >= 7) {
             try {
                 return new CurvePoint(
-                    evalScriptExpr(p[0]),
-                    evalScriptExpr(p[1]),
-                    evalScriptExpr(p[2]),
-                    evalScriptExpr(p[3]),
-                    evalScriptExpr(p[4]),
-                    Math.toRadians(evalScriptExpr(p[5])),
-                    evalScriptExpr(p[6])
+                    evalScriptExpr(p[0], isRedAlliance),
+                    evalScriptExpr(p[1], isRedAlliance),
+                    evalScriptExpr(p[2], isRedAlliance),
+                    evalScriptExpr(p[3], isRedAlliance),
+                    evalScriptExpr(p[4], isRedAlliance),
+                    Math.toRadians(evalScriptExpr(p[5], isRedAlliance)),
+                    evalScriptExpr(p[6], isRedAlliance)
                 );
             } catch (Exception e) {
                 System.err.println("Error parsing point line: " + line);
@@ -427,9 +427,9 @@ public class FtcFieldSimulatorApp extends Application {
             String[] parts = m.group(1).split(",");
             if (parts.length >= 3) {
                 try {
-                    double x = evalScriptExpr(parts[0]);
-                    double y = evalScriptExpr(parts[1]);
-                    double h = evalScriptExpr(parts[2]);
+                    double x = evalScriptExpr(parts[0], isRedAlliance);
+                    double y = evalScriptExpr(parts[1], isRedAlliance);
+                    double h = evalScriptExpr(parts[2], isRedAlliance);
                     
                     controlPanel.getStartXField().setText(String.format(Locale.US, "%.2f", x));
                     controlPanel.getStartYField().setText(String.format(Locale.US, "%.2f", y));
@@ -476,8 +476,18 @@ public class FtcFieldSimulatorApp extends Application {
         return String.format(Locale.US, "h(%.2f)", normalizeDegrees(180.0 - redDegrees));
     }
 
-    private double evalScriptExpr(String expr) {
+    private double evalScriptExpr(String expr, boolean isRed) {
         expr = expr.trim();
+        if (expr.startsWith("y(")) {
+            double allianceMultiplier = isRed ? -1.0 : 1.0;
+            Matcher m = Pattern.compile("y\\(\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
+            if (m.find()) {
+                return Double.parseDouble(m.group(1)) * allianceMultiplier;
+            }
+        }
+        if (expr.startsWith("h(") || expr.startsWith("reflectH(")) {
+            return parseHeadingExpression(expr, isRed);
+        }
         try {
             return Double.parseDouble(expr);
         } catch (NumberFormatException e) {
@@ -606,7 +616,6 @@ public class FtcFieldSimulatorApp extends Application {
         if (deletedIndex == 0 && allPaths.indexOf(selectedPath) == 0 && !selectedPath.points.isEmpty()) {
             CurvePoint newFirstPoint = selectedPath.points.get(0);
             robot.setPosition(newFirstPoint.x, newFirstPoint.y);
-            controlPanel.updateRobotStartFields(newFirstPoint.x, newFirstPoint.y, robot.getHeadingDegrees());
         }
 
         fieldDisplay.setHighlightedPoint(null);
@@ -624,7 +633,6 @@ public class FtcFieldSimulatorApp extends Application {
         fieldDisplay.setOnPointDrag((index, newCoords) -> {
             if (selectedPath == null) return;
             if (index == 0 && allPaths.indexOf(selectedPath) == 0) {
-                controlPanel.updateRobotStartFields(newCoords.getX(), newCoords.getY(), robot.getHeadingDegrees());
                 robot.setPosition(newCoords.getX(), newCoords.getY());
             }
             // Chaining logic: if this is the last point, and there's a next path, update next path's first point
@@ -700,14 +708,6 @@ public class FtcFieldSimulatorApp extends Application {
 
             if (fieldStatusDisplay != null) {
                 fieldStatusDisplay.updateRobotStatus(robot.getXInches(), robot.getYInches(), displayHeading);
-            }
-
-            if (controlPanel != null && !(
-                    controlPanel.getStartXField().isFocused() ||
-                            controlPanel.getStartYField().isFocused() ||
-                            controlPanel.getStartHeadingField().isFocused()
-            )) {
-                controlPanel.updateRobotStartFields(robot.getXInches(), robot.getYInches(), displayHeading);
             }
 
             fieldDisplay.drawCurrentState();
@@ -926,15 +926,23 @@ public class FtcFieldSimulatorApp extends Application {
 
         // 1. Detect start position (INIT)
         // Look for Pose2D(world, x, y, h) or Pose2D(x, y, h) or inside SetInitialPoseCommand
-        Pattern posePattern = Pattern.compile("(?:new\\s+Pose2D|new\\s+SetInitialPoseCommand)\\s*\\(\\s*(?:[^,]*\\s*,\\s*)?([\\d\\.\\-]+)\\s*,\\s*(?:y\\(\\s*([\\d\\.\\-]+)\\s*\\)|([\\d\\.\\-]+))\\s*,\\s*(?:[^,]*\\s*,\\s*)?([^,)]+)\\s*\\)");
+        // We use a pattern that correctly handles balanced parentheses for nested calls like y() or h()
+        Pattern posePattern = Pattern.compile("(?:new\\s+Pose2D|new\\s+SetInitialPoseCommand|SetInitialPoseCommand)\\s*\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
         Matcher poseMatcher = posePattern.matcher(code);
         String initialPoseLine = null;
         if (poseMatcher.find()) {
-            double x = Double.parseDouble(poseMatcher.group(1));
-            double y = (poseMatcher.group(2) != null) ? Double.parseDouble(poseMatcher.group(2)) * allianceMultiplier : Double.parseDouble(poseMatcher.group(3)) * allianceMultiplier;
-            String hExprStr = poseMatcher.group(4).trim();
-            double hField = parseHeadingExpression(hExprStr, isRed);
-            initialPoseLine = AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine;
+            String allArgs = poseMatcher.group(1).trim();
+            String[] argParts = splitArgsIgnoreParens(allArgs);
+            if (argParts.length >= 3) {
+                // If 4 args, first is world. If 3, first is X.
+                int offset = (argParts.length == 4) ? 1 : 0;
+                try {
+                    double x = Double.parseDouble(argParts[offset]);
+                    double y = evalScriptExpr(argParts[offset + 1], isRed);
+                    double hField = parseHeadingExpression(argParts[offset + 2], isRed);
+                    initialPoseLine = AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine;
+                } catch (Exception ignored) {}
+            }
         }
 
         // 2. Multi-pass parsing for paths and commands
@@ -1016,14 +1024,20 @@ public class FtcFieldSimulatorApp extends Application {
                 } else if (line.contains("SetInitialPoseCommand")) {
                     sequenceHasInitialPose = true;
                     // Already handled by INIT detection at the top, or capture here if it appears in scheduler
-                    Pattern sipc = Pattern.compile("(?:new\\s+Pose2D|SetInitialPoseCommand)\\s*\\(\\s*(?:[^,]*\\s*,\\s*)?([\\d\\.\\-]+)\\s*,\\s*(?:y\\(\\s*([\\d\\.\\-]+)\\s*\\)|([\\d\\.\\-]+))\\s*,\\s*(?:[^,]*\\s*,\\s*)?([^,)]+)\\s*\\)");
+                    Pattern sipc = Pattern.compile("(?:new\\s+Pose2D|new\\s+SetInitialPoseCommand|SetInitialPoseCommand)\\s*\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
                     Matcher sm = sipc.matcher(line);
                     if (sm.find()) {
-                        double x = Double.parseDouble(sm.group(1));
-                        double y = (sm.group(2) != null) ? Double.parseDouble(sm.group(2)) * allianceMultiplier : Double.parseDouble(sm.group(3)) * allianceMultiplier;
-                        String hExprStr = sm.group(4).trim();
-                        double hField = parseHeadingExpression(hExprStr, isRed);
-                        script.append(AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine).append("\n");
+                        String allArgs = sm.group(1).trim();
+                        String[] argParts = splitArgsIgnoreParens(allArgs);
+                        if (argParts.length >= 3) {
+                            int offset = (argParts.length == 4) ? 1 : 0;
+                            try {
+                                double x = Double.parseDouble(argParts[offset]);
+                                double y = evalScriptExpr(argParts[offset + 1], isRed);
+                                double hField = parseHeadingExpression(argParts[offset + 2], isRed);
+                                script.append(AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine).append("\n");
+                            } catch (Exception ignored) {}
+                        }
                     }
                 } else if (line.contains("WaitCommand")) {
                     Matcher wm = Pattern.compile("WaitCommand\\((.*?)\\)").matcher(line);
@@ -1032,7 +1046,7 @@ public class FtcFieldSimulatorApp extends Application {
                     }
                 } else {
                     // Generic command - handles one level of nested parentheses for y() calls
-                    Pattern cmPattern = Pattern.compile("new\\s+(\\w+)\\(([^)]*(\\([^)]*\\)[^)]*)*)\\)");
+                    Pattern cmPattern = Pattern.compile("new\\s+(\\w+)\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
                     Matcher cm = cmPattern.matcher(line);
                     if (cm.find()) {
                         String className = cm.group(1);
@@ -1055,6 +1069,26 @@ public class FtcFieldSimulatorApp extends Application {
         }
 
         return script.toString();
+    }
+
+    private String[] splitArgsIgnoreParens(String args) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < args.length(); i++) {
+            char c = args.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+
+            if (c == ',' && depth == 0) {
+                parts.add(sb.toString().trim());
+                sb = new StringBuilder();
+            } else {
+                sb.append(c);
+            }
+        }
+        parts.add(sb.toString().trim());
+        return parts.toArray(new String[0]);
     }
 
     private String formatYForJava(double fieldY, double allianceMultiplier) {
@@ -1127,7 +1161,7 @@ public class FtcFieldSimulatorApp extends Application {
             }
         }
         // Handle "h(90)"
-        if (expr.startsWith("h(")) {
+        if (expr.contains("h(")) {
             Matcher m = Pattern.compile("h\\(\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
             if (m.find()) {
                 double blueDeg = Double.parseDouble(m.group(1));
@@ -1136,7 +1170,7 @@ public class FtcFieldSimulatorApp extends Application {
             }
         }
         // Handle "reflectH(90, 0)"
-        if (expr.startsWith("reflectH(")) {
+        if (expr.contains("reflectH(")) {
             Matcher m = Pattern.compile("reflectH\\(\\s*([\\d\\.\\-]+)\\s*,\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
             if (m.find()) {
                 double blueDeg = Double.parseDouble(m.group(1));
@@ -1752,7 +1786,6 @@ public class FtcFieldSimulatorApp extends Application {
                 // First path in the sequence starts at the robot's initial position
                 double startHeading = 0.0;
                 robot.setPosition(fieldX, fieldY, startHeading);
-                controlPanel.updateRobotStartFields(fieldX, fieldY, startHeading);
                 updateUIFromRobotState();
             }
         }
@@ -2158,11 +2191,6 @@ public class FtcFieldSimulatorApp extends Application {
             if (event.getCode() == KeyCode.UP || event.getCode() == KeyCode.DOWN ||
                     event.getCode() == KeyCode.A || event.getCode() == KeyCode.D) {
                 robot.setPosition(newFieldX, newFieldY);
-            }
-            if (controlPanel != null) {
-                double displayHeading = robot.getHeadingDegrees() % 360;
-                if (displayHeading < 0) displayHeading += 360;
-                controlPanel.updateRobotStartFields(robot.getXInches(), robot.getYInches(), displayHeading);
             }
             updateUIFromRobotState();
             event.consume();
