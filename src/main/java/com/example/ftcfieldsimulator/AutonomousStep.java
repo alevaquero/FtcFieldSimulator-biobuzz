@@ -43,8 +43,9 @@ public class AutonomousStep {
                 name, headingExpr, transition);
     }
 
-    public void updatePathHeader(String name, double heading, String transition) {
-        updatePathHeader(name, String.format(Locale.US, "%.1f", heading), transition);
+    public void updatePathHeader(String name, double fieldHeading, String transition) {
+        this.rawLine = String.format(Locale.US, "PATH: name=\"%s\" | heading=%.2f | transition=%s",
+                name, fieldHeading, transition);
     }
 
     public static AutonomousStep pathHeader(String name, String headingExpr, String transition) {
@@ -53,8 +54,10 @@ public class AutonomousStep {
         return new AutonomousStep(Type.PATH_HEADER, line);
     }
 
-    public static AutonomousStep pathHeader(String name, double heading, String transition) {
-        return pathHeader(name, String.format(Locale.US, "%.1f", heading), transition);
+    public static AutonomousStep pathHeader(String name, double fieldHeading, String transition) {
+        String line = String.format(Locale.US, "PATH: name=\"%s\" | heading=%.2f | transition=%s",
+                name, fieldHeading, transition);
+        return new AutonomousStep(Type.PATH_HEADER, line);
     }
 
     public static AutonomousStep point(CurvePoint p) {
@@ -80,7 +83,7 @@ public class AutonomousStep {
         return new AutonomousStep(Type.CMD, sb.toString());
     }
 
-    public static AutonomousStep init(double x, double y, double h, String alliance) {
+    public static AutonomousStep init(double x, double y, double h) {
         String line = String.format(Locale.US, "CMD: SetInitialPoseCommand | args=[%.2f, %.2f, %.2f] | name=\"Start Pose\"", x, y, h);
         return new AutonomousStep(Type.CMD, line);
     }

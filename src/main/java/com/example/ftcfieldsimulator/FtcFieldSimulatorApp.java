@@ -31,6 +31,9 @@ import javafx.scene.control.Dialog;
 import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.ButtonBar;
 import javafx.scene.control.ComboBox;
+import javafx.scene.control.CheckBox;
+import javafx.scene.control.RadioButton;
+import javafx.scene.control.ToggleGroup;
 
 import com.example.ftcfieldsimulator.UdpPositionListener.CircleData;
 import com.example.ftcfieldsimulator.UdpPositionListener.KeyValueData;
@@ -457,24 +460,7 @@ public class FtcFieldSimulatorApp extends Application {
         }
     }
 
-    private String wrapH(double redDegrees, String originalExpr, double allianceMultiplier) {
-        if (Math.abs(allianceMultiplier - 1.0) < 1e-9) {
-            return String.format(Locale.US, "%.2f", redDegrees);
-        }
-        if (originalExpr != null) {
-            originalExpr = originalExpr.trim();
-            if (originalExpr.startsWith("h(")) {
-                return String.format(Locale.US, "h(%.2f)", normalizeDegrees(180.0 - redDegrees));
-            } else if (originalExpr.startsWith("reflectH(")) {
-                Matcher m = Pattern.compile("reflectH\\(\\s*[\\d\\.\\-]+\\s*,\\s*([\\d\\.\\-]+)\\s*\\)").matcher(originalExpr);
-                if (m.find()) {
-                    double axis = Double.parseDouble(m.group(1));
-                    return String.format(Locale.US, "reflectH(%.2f, %.2f)", normalizeDegrees(2 * axis - redDegrees), axis);
-                }
-            }
-        }
-        return String.format(Locale.US, "h(%.2f)", normalizeDegrees(180.0 - redDegrees));
-    }
+
 
     private double evalScriptExpr(String expr, boolean isRed) {
         expr = expr.trim();
@@ -485,7 +471,7 @@ public class FtcFieldSimulatorApp extends Application {
                 return Double.parseDouble(m.group(1)) * allianceMultiplier;
             }
         }
-        if (expr.startsWith("h(") || expr.startsWith("reflectH(")) {
+        if (expr.startsWith("fa(") || expr.startsWith("h(") || expr.startsWith("reflectH(")) {
             return parseHeadingExpression(expr, isRed);
         }
         try {
@@ -632,9 +618,10 @@ public class FtcFieldSimulatorApp extends Application {
         fieldDisplay.setOnSegmentClick(this::handleInsertPoint);
         fieldDisplay.setOnPointDrag((index, newCoords) -> {
             if (selectedPath == null) return;
-            if (index == 0 && allPaths.indexOf(selectedPath) == 0) {
-                robot.setPosition(newCoords.getX(), newCoords.getY());
-            }
+            
+            // Move robot to the point as it's being dragged
+            snapRobotToPoint(selectedPath, index);
+
             // Chaining logic: if this is the last point, and there's a next path, update next path's first point
             if (index == selectedPath.points.size() - 1) {
                 int pathIndex = allPaths.indexOf(selectedPath);
@@ -692,6 +679,10 @@ public class FtcFieldSimulatorApp extends Application {
 
         CurvePoint newPoint = new CurvePoint(clickCoordsInches.getX(), clickCoordsInches.getY(), newMoveSpeed, newTurnSpeed, newFollowDistance, newSlowDownTurnRadians, newSlowDownTurnAmount);
         selectedPath.points.add(segmentIndex + 1, newPoint);
+        
+        // Move robot to the newly inserted point
+        snapRobotToPoint(selectedPath, segmentIndex + 1);
+
         fieldDisplay.setPathsToDraw(allPaths, selectedPath);
         fieldDisplay.setHighlightedPoint(newPoint);
         updateControlPanelForPathState();
@@ -778,6 +769,31 @@ public class FtcFieldSimulatorApp extends Application {
             popupScriptArea.setPrefSize(800, 600);
             popupScriptArea.setWrapText(false); // Line numbers only work well without wrapping
 
+            RadioButton blueBtn = new RadioButton("Blue Alliance");
+            RadioButton redBtn = new RadioButton("Red Alliance");
+            ToggleGroup group = new ToggleGroup();
+            blueBtn.setToggleGroup(group);
+            redBtn.setToggleGroup(group);
+            
+            if (isRedAlliance) redBtn.setSelected(true);
+            else blueBtn.setSelected(true);
+
+            group.selectedToggleProperty().addListener((obs, oldToggle, newToggle) -> {
+                boolean targetRed = (newToggle == redBtn);
+                if (targetRed != isRedAlliance) {
+                    boolean oldRed = isRedAlliance;
+                    this.isRedAlliance = targetRed;
+                    // Automatically transform numeric values to maintain field positions
+                    transformScriptAlliance(oldRed, targetRed);
+                    // Refresh display and state
+                    updateStateFromMissionScript(popupScriptArea.getText());
+                }
+            });
+
+            HBox allianceBox = new HBox(15, new Label("Context:"), blueBtn, redBtn);
+            allianceBox.setAlignment(Pos.CENTER_LEFT);
+            allianceBox.setPadding(new Insets(0, 0, 5, 0));
+
             // Line numbers gutter
             TextArea lineNumbersArea = new TextArea("1");
             lineNumbersArea.setFont(Font.font("Consolas", 14));
@@ -847,7 +863,7 @@ public class FtcFieldSimulatorApp extends Application {
             hintArea.setFont(Font.font("Consolas", 12));
             hintArea.setText(
                 "# Quick Reference (Copy & Paste templates):\n" +
-                "CMD: SetInitialPoseCommand | args=[-62.04, y(14.00), 0.00] | name=\"Start\"\n" +
+                "CMD: SetInitialPoseCommand | args=[-62.04, 14.00, 0.00] | name=\"Start\"\n" +
                 "PATH: name=\"Drive to Shoot\" | heading=90.0 | transition=END\n" +
                 "P: -60.0, 10.0, 1.0, 0.4, 10.0, 60.0, 0.60\n" +
                 "WAIT: 1.5\n" +
@@ -855,7 +871,7 @@ public class FtcFieldSimulatorApp extends Application {
             );
             hintArea.setStyle("-fx-control-inner-background: #F5F5F5; -fx-text-fill: #555;");
 
-            VBox root = new VBox(10, new Label("Edit Mission Script:"), editorBox, new Label("Available Step Formats:"), hintArea);
+            VBox root = new VBox(10, new Label("Edit Mission Script:"), allianceBox, editorBox, new Label("Available Step Formats:"), hintArea);
             VBox.setVgrow(editorBox, Priority.ALWAYS);
             root.setPadding(new Insets(10));
 
@@ -863,10 +879,82 @@ public class FtcFieldSimulatorApp extends Application {
             missionEditorStage.setScene(scene);
         } else {
             popupScriptArea.setText(controlPanel.getMissionScript());
+            // Update selection if state changed elsewhere (like Import)
+            VBox root = (VBox) missionEditorStage.getScene().getRoot();
+            HBox allianceRow = (HBox) root.getChildren().get(1);
+            RadioButton blueBtn = (RadioButton) allianceRow.getChildren().get(1);
+            RadioButton redBtn = (RadioButton) allianceRow.getChildren().get(2);
+            if (isRedAlliance) redBtn.setSelected(true);
+            else blueBtn.setSelected(true);
         }
 
         missionEditorStage.show();
         missionEditorStage.toFront();
+    }
+
+    private void transformScriptAlliance(boolean fromRed, boolean toRed) {
+        String currentText = popupScriptArea.getText();
+        if (currentText == null || currentText.isEmpty()) return;
+
+        StringBuilder sb = new StringBuilder();
+        String[] lines = currentText.split("\\r?\\n");
+        for (String line : lines) {
+            String transformed = transformLineAlliance(line, fromRed, toRed);
+            sb.append(transformed).append("\n");
+        }
+        popupScriptArea.setText(sb.toString().trim());
+        controlPanel.setMissionScript(popupScriptArea.getText());
+    }
+
+    private String transformLineAlliance(String line, boolean fromRed, boolean toRed) {
+        String trimmed = line.trim();
+        
+        // P: x, y, ms, ts, fd, slowTurnDeg, sa
+        if (trimmed.startsWith("P:")) {
+            String content = trimmed.substring(2).trim();
+            String[] p = content.split(",\\s*");
+            if (p.length >= 7) {
+                try {
+                    double y = Double.parseDouble(p[1]);
+                    // Only flip Y. Parameters like slowTurnDeg (p[5]) stay constant.
+                    p[1] = String.format(Locale.US, "%.2f", -y);
+                    
+                    return "P: " + String.join(", ", p);
+                } catch (Exception ignored) {}
+            }
+        }
+
+        // PATH: name="..." | heading=val | ...
+        if (trimmed.startsWith("PATH:")) {
+            Pattern hPat = Pattern.compile("heading=([\\d\\.\\-]+)");
+            Matcher m = hPat.matcher(line);
+            if (m.find()) {
+                double h = Double.parseDouble(m.group(1));
+                // Path heading is a "Follow Angle" -> 180 - degrees
+                return line.replaceFirst("heading=[\\d\\.\\-]+", "heading=" + String.format(Locale.US, "%.2f", normalizeDegrees(180.0 - h)));
+            }
+        }
+
+        // CMD: SetInitialPoseCommand | args=[x, y, h]
+        if (trimmed.contains("SetInitialPoseCommand")) {
+            Pattern argsPat = Pattern.compile("args=\\[(.*?)\\]");
+            Matcher m = argsPat.matcher(line);
+            if (m.find()) {
+                String[] args = m.group(1).split(",\\s*");
+                if (args.length >= 3) {
+                    try {
+                        double y = Double.parseDouble(args[1]);
+                        double h = Double.parseDouble(args[2]);
+                        args[1] = String.format(Locale.US, "%.2f", -y);
+                        // Initial Pose heading -> 360 - degrees
+                        args[2] = String.format(Locale.US, "%.2f", normalizeDegrees(360.0 - h));
+                        return line.replaceFirst("args=\\[.*?\\]", "args=[" + String.join(", ", args) + "]");
+                    } catch (Exception ignored) {}
+                }
+            }
+        }
+        
+        return line;
     }
 
     private void showImportMissionDialog() {
@@ -881,12 +969,19 @@ public class FtcFieldSimulatorApp extends Application {
         textArea.setPrefHeight(400);
         textArea.setPrefWidth(800);
 
-        ComboBox<String> allianceSelector = new ComboBox<>();
-        allianceSelector.getItems().addAll("Blue Alliance", "Red Alliance");
-        allianceSelector.setValue(isRedAlliance ? "Red Alliance" : "Blue Alliance");
-        allianceSelector.setMaxWidth(Double.MAX_VALUE);
+        RadioButton blueBtn = new RadioButton("Blue Alliance");
+        RadioButton redBtn = new RadioButton("Red Alliance");
+        ToggleGroup group = new ToggleGroup();
+        blueBtn.setToggleGroup(group);
+        redBtn.setToggleGroup(group);
+        
+        if (isRedAlliance) redBtn.setSelected(true);
+        else blueBtn.setSelected(true);
 
-        VBox content = new VBox(10, new Label("Java Code Snippet:"), textArea, new Label("Alliance context:"), allianceSelector);
+        HBox allianceBox = new HBox(15, new Label("Alliance Context:"), blueBtn, redBtn);
+        allianceBox.setAlignment(Pos.CENTER_LEFT);
+
+        VBox content = new VBox(10, new Label("Java Code Snippet:"), textArea, allianceBox);
         VBox.setVgrow(textArea, Priority.ALWAYS);
         dialog.getDialogPane().setContent(content);
         dialog.getDialogPane().setPrefSize(800, 600);
@@ -896,7 +991,7 @@ public class FtcFieldSimulatorApp extends Application {
 
         dialog.setResultConverter(dialogButton -> {
             if (dialogButton == importButtonType) {
-                return new ImportResult(textArea.getText(), "Red Alliance".equals(allianceSelector.getValue()));
+                return new ImportResult(textArea.getText(), redBtn.isSelected());
             }
             return null;
         });
@@ -940,7 +1035,7 @@ public class FtcFieldSimulatorApp extends Application {
                     double x = Double.parseDouble(argParts[offset]);
                     double y = evalScriptExpr(argParts[offset + 1], isRed);
                     double hField = parseHeadingExpression(argParts[offset + 2], isRed);
-                    initialPoseLine = AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine;
+                    initialPoseLine = AutonomousStep.init(x, y, hField).rawLine;
                 } catch (Exception ignored) {}
             }
         }
@@ -991,7 +1086,6 @@ public class FtcFieldSimulatorApp extends Application {
                         String pathVar = fm.group(1);
                         String hExprStr = fm.group(2).trim(); 
                         double hField = parseHeadingExpression(hExprStr, isRed);
-                        String hExprForScript = wrapH(hField, hExprStr, allianceMultiplier);
                         
                         String stepName = "Drive";
                         Matcher nm = Pattern.compile("\\.withName\\(\"(.*?)\"\\)").matcher(line);
@@ -1012,7 +1106,7 @@ public class FtcFieldSimulatorApp extends Application {
                             trans = "IMMEDIATE";
                         }
 
-                        script.append(AutonomousStep.pathHeader(stepName, hField, trans).rawLine).append("\n");
+                        script.append(AutonomousStep.pathHeader(stepName, hField, trans)).append("\n");
                         List<CurvePoint> points = pathsFound.get(pathVar);
                         if (points != null) {
                             for (CurvePoint p : points) {
@@ -1035,7 +1129,7 @@ public class FtcFieldSimulatorApp extends Application {
                                 double x = Double.parseDouble(argParts[offset]);
                                 double y = evalScriptExpr(argParts[offset + 1], isRed);
                                 double hField = parseHeadingExpression(argParts[offset + 2], isRed);
-                                script.append(AutonomousStep.init(x, y, hField, isRed ? "RED" : "BLUE").rawLine).append("\n");
+                                script.append(AutonomousStep.init(x, y, hField).rawLine).append("\n");
                             } catch (Exception ignored) {}
                         }
                     }
@@ -1096,8 +1190,13 @@ public class FtcFieldSimulatorApp extends Application {
         return String.format(Locale.US, "y(%.2f)", blueY);
     }
 
+    private String formatFAForJava(double fieldHeading, boolean isRed) {
+        double blueFA = isRed ? normalizeDegrees(180.0 - fieldHeading) : fieldHeading;
+        return String.format(Locale.US, "fa(%.2f)", blueFA);
+    }
+
     private String formatHForJava(double fieldHeading, boolean isRed) {
-        double blueH = isRed ? normalizeDegrees(180.0 - fieldHeading) : fieldHeading;
+        double blueH = isRed ? normalizeDegrees(360.0 - fieldHeading) : fieldHeading;
         return String.format(Locale.US, "h(%.2f)", blueH);
     }
 
@@ -1118,7 +1217,22 @@ public class FtcFieldSimulatorApp extends Application {
         sb.append(args.substring(lastEnd));
         args = sb.toString();
 
-        // Resolve h()
+        // Resolve fa() - was h()
+        Pattern faPattern = Pattern.compile("fa\\(\\s*([\\d\\.\\-]+)\\s*\\)");
+        Matcher fam = faPattern.matcher(args);
+        sb = new StringBuilder();
+        lastEnd = 0;
+        while (fam.find()) {
+            sb.append(args, lastEnd, fam.start());
+            double val = Double.parseDouble(fam.group(1));
+            double res = isRed ? normalizeDegrees(180.0 - val) : val;
+            sb.append(String.format(Locale.US, "%.2f", res));
+            lastEnd = fam.end();
+        }
+        sb.append(args.substring(lastEnd));
+        args = sb.toString();
+
+        // Resolve h() - new logic
         Pattern hPattern = Pattern.compile("h\\(\\s*([\\d\\.\\-]+)\\s*\\)");
         Matcher hm = hPattern.matcher(args);
         sb = new StringBuilder();
@@ -1126,7 +1240,7 @@ public class FtcFieldSimulatorApp extends Application {
         while (hm.find()) {
             sb.append(args, lastEnd, hm.start());
             double val = Double.parseDouble(hm.group(1));
-            double res = isRed ? normalizeDegrees(180.0 - val) : val;
+            double res = isRed ? normalizeDegrees(360.0 - val) : val;
             sb.append(String.format(Locale.US, "%.2f", res));
             lastEnd = hm.end();
         }
@@ -1160,13 +1274,22 @@ public class FtcFieldSimulatorApp extends Application {
                 return isRed ? Double.parseDouble(m.group(1)) : Double.parseDouble(m.group(2));
             }
         }
-        // Handle "h(90)"
+        // Handle "fa(90)" - follow angle
+        if (expr.contains("fa(")) {
+            Matcher m = Pattern.compile("fa\\(\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
+            if (m.find()) {
+                double blueDeg = Double.parseDouble(m.group(1));
+                if (!isRed) return blueDeg;
+                return normalizeDegrees(180.0 - blueDeg);
+            }
+        }
+        // Handle "h(90)" - initial heading
         if (expr.contains("h(")) {
             Matcher m = Pattern.compile("h\\(\\s*([\\d\\.\\-]+)\\s*\\)").matcher(expr);
             if (m.find()) {
                 double blueDeg = Double.parseDouble(m.group(1));
                 if (!isRed) return blueDeg;
-                return normalizeDegrees(180.0 - blueDeg);
+                return normalizeDegrees(360.0 - blueDeg);
             }
         }
         // Handle "reflectH(90, 0)"
@@ -1254,7 +1377,7 @@ public class FtcFieldSimulatorApp extends Application {
                         j++;
                     }
                     double hPathField = Double.parseDouble(hExpr.trim());
-                    String hPathExpr = formatHForJava(hPathField, isRedAlliance);
+                    String hPathExpr = formatFAForJava(hPathField, isRedAlliance);
 
                     code.append("    scheduler.add(new FollowPathCommand(").append(varName).append(", ").append(hPathExpr).append(", debug)\n");
                     if ("IMMEDIATE".equals(trans)) code.append("            .transitionImmediately()\n");
@@ -1693,7 +1816,7 @@ public class FtcFieldSimulatorApp extends Application {
     private void showCodePopup(String code) {
         Alert alert = new Alert(Alert.AlertType.INFORMATION);
         alert.setTitle("Exported Java Code");
-        alert.setHeaderText("Copy the code below. It uses y() for alliance mirroring.");
+        alert.setHeaderText("Copy the code below. It uses y(), h() and fa() for alliance mirroring.");
         alert.setResizable(true);
 
         TextArea textArea = new TextArea(code);
@@ -1811,6 +1934,9 @@ public class FtcFieldSimulatorApp extends Application {
 
         CurvePoint newPoint = new CurvePoint(fieldX, fieldY, moveSpeed, turnSpeed, followDistance, slowDownTurnRad, slowDownTurnAmount);
         selectedPath.points.add(newPoint);
+
+        // Move robot to the newly added point
+        snapRobotToPoint(selectedPath, selectedPath.points.size() - 1);
         
         // Refresh the display with current state
         fieldDisplay.setPathsToDraw(allPaths, selectedPath);
