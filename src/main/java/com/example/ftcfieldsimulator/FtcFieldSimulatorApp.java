@@ -86,6 +86,7 @@ public class FtcFieldSimulatorApp extends Application {
     private PathData selectedPath = null;
     private boolean isCreatingPath = false;
     private boolean isUpdatingFromScript = false; // Flag to prevent recursion
+    private boolean isNavigating = false; // Flag to prevent redundant snaps during point navigation
     private Map<String, LineData> namedLinesToDraw = new HashMap<>();
     private final Object namedLinesLock = new Object();
     private Map<TextField, String> textFieldPreviousValues = new HashMap<>();
@@ -498,8 +499,10 @@ public class FtcFieldSimulatorApp extends Application {
             controlPanel.getFollowAngleField().setText(selectedPath.followAngle);
             updateControlPanelForPathState();
 
-            // Snap robot to the start of the selected path
-            snapRobotToPath(selectedPath);
+            // Snap robot to the start of the selected path (only if not doing bulk navigation)
+            if (!isNavigating) {
+                snapRobotToPath(selectedPath);
+            }
 
             if (fieldDisplay != null) {
                 fieldDisplay.setPathsToDraw(allPaths, selectedPath);
@@ -558,38 +561,43 @@ public class FtcFieldSimulatorApp extends Application {
             currentIndex = selectedPath.points.indexOf(currentSelection);
         }
 
-        if (offset > 0) { // Next
-            if (currentIndex < selectedPath.points.size() - 1) {
-                // Next point in same path
-                controlPanel.getPointSelectionComboBox().setValue(selectedPath.points.get(currentIndex + 1));
-            } else {
-                // Go to next path, first point
-                int pathIdx = allPaths.indexOf(selectedPath);
-                if (pathIdx < allPaths.size() - 1) {
-                    PathData nextPath = allPaths.get(pathIdx + 1);
-                    if (!nextPath.points.isEmpty()) {
-                        // Change path and explicitly select first point
-                        controlPanel.getPathSelectionComboBox().setValue(nextPath);
-                        controlPanel.getPointSelectionComboBox().setValue(nextPath.points.get(0));
+        isNavigating = true;
+        try {
+            if (offset > 0) { // Next
+                if (currentIndex < selectedPath.points.size() - 1) {
+                    // Next point in same path
+                    controlPanel.getPointSelectionComboBox().setValue(selectedPath.points.get(currentIndex + 1));
+                } else {
+                    // Go to next path, first point
+                    int pathIdx = allPaths.indexOf(selectedPath);
+                    if (pathIdx < allPaths.size() - 1) {
+                        PathData nextPath = allPaths.get(pathIdx + 1);
+                        if (!nextPath.points.isEmpty()) {
+                            // Change path and explicitly select first point
+                            controlPanel.getPathSelectionComboBox().setValue(nextPath);
+                            controlPanel.getPointSelectionComboBox().setValue(nextPath.points.get(0));
+                        }
+                    }
+                }
+            } else if (offset < 0) { // Previous
+                if (currentIndex > 0) {
+                    // Previous point in same path
+                    controlPanel.getPointSelectionComboBox().setValue(selectedPath.points.get(currentIndex - 1));
+                } else if (currentIndex == 0 || currentIndex == -1) {
+                    // At P1 or ALL, go to previous path, last point
+                    int pathIdx = allPaths.indexOf(selectedPath);
+                    if (pathIdx > 0) {
+                        PathData prevPath = allPaths.get(pathIdx - 1);
+                        if (!prevPath.points.isEmpty()) {
+                            // Change path and explicitly select last point
+                            controlPanel.getPathSelectionComboBox().setValue(prevPath);
+                            controlPanel.getPointSelectionComboBox().setValue(prevPath.points.get(prevPath.points.size() - 1));
+                        }
                     }
                 }
             }
-        } else if (offset < 0) { // Previous
-            if (currentIndex > 0) {
-                // Previous point in same path
-                controlPanel.getPointSelectionComboBox().setValue(selectedPath.points.get(currentIndex - 1));
-            } else if (currentIndex == 0 || currentIndex == -1) {
-                // At P1 or ALL, go to previous path, last point
-                int pathIdx = allPaths.indexOf(selectedPath);
-                if (pathIdx > 0) {
-                    PathData prevPath = allPaths.get(pathIdx - 1);
-                    if (!prevPath.points.isEmpty()) {
-                        // Change path and explicitly select last point
-                        controlPanel.getPathSelectionComboBox().setValue(prevPath);
-                        controlPanel.getPointSelectionComboBox().setValue(prevPath.points.get(prevPath.points.size() - 1));
-                    }
-                }
-            }
+        } finally {
+            isNavigating = false;
         }
     }
 
