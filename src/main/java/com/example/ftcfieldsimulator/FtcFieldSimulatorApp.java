@@ -917,6 +917,8 @@ public class FtcFieldSimulatorApp extends Application {
     private String transformLineAlliance(String line, boolean fromRed, boolean toRed) {
         String trimmed = line.trim();
         
+        // 1. Transform raw numeric values for known simulator structures
+        
         // P: x, y, ms, ts, fd, slowTurnDeg, sa
         if (trimmed.startsWith("P:")) {
             String content = trimmed.substring(2).trim();
@@ -924,9 +926,7 @@ public class FtcFieldSimulatorApp extends Application {
             if (p.length >= 7) {
                 try {
                     double y = Double.parseDouble(p[1]);
-                    // Only flip Y. Parameters like slowTurnDeg (p[5]) stay constant.
                     p[1] = String.format(Locale.US, "%.2f", -y);
-                    
                     return "P: " + String.join(", ", p);
                 } catch (Exception ignored) {}
             }
@@ -938,7 +938,7 @@ public class FtcFieldSimulatorApp extends Application {
             Matcher m = hPat.matcher(line);
             if (m.find()) {
                 double h = Double.parseDouble(m.group(1));
-                // Path heading is a "Follow Angle" -> 180 - degrees
+                // Path heading is a "Follow Angle" -> fa() logic: 180 - degrees
                 return line.replaceFirst("heading=[\\d\\.\\-]+", "heading=" + String.format(Locale.US, "%.2f", normalizeDegrees(180.0 - h)));
             }
         }
@@ -948,14 +948,31 @@ public class FtcFieldSimulatorApp extends Application {
             Pattern argsPat = Pattern.compile("args=\\[(.*?)\\]");
             Matcher m = argsPat.matcher(line);
             if (m.find()) {
-                String[] args = m.group(1).split(",\\s*");
+                String[] args = splitArgsIgnoreParens(m.group(1));
                 if (args.length >= 3) {
                     try {
                         double y = Double.parseDouble(args[1]);
                         double h = Double.parseDouble(args[2]);
                         args[1] = String.format(Locale.US, "%.2f", -y);
-                        // Initial Pose heading -> 360 - degrees
+                        // Initial Pose heading -> h() logic: 360 - degrees
                         args[2] = String.format(Locale.US, "%.2f", normalizeDegrees(360.0 - h));
+                        return line.replaceFirst("args=\\[.*?\\]", "args=[" + String.join(", ", args) + "]");
+                    } catch (Exception ignored) {}
+                }
+            }
+        }
+
+        // Generic Command special cases
+        if (trimmed.contains("AutoIntakeCommand")) {
+            Pattern argsPat = Pattern.compile("args=\\[(.*?)\\]");
+            Matcher m = argsPat.matcher(line);
+            if (m.find()) {
+                String[] args = splitArgsIgnoreParens(m.group(1));
+                if (args.length >= 1) {
+                    try {
+                        double h = Double.parseDouble(args[0]);
+                        // AutoIntake heading uses h() logic -> 360 - degrees
+                        args[0] = String.format(Locale.US, "%.2f", normalizeDegrees(360.0 - h));
                         return line.replaceFirst("args=\\[.*?\\]", "args=[" + String.join(", ", args) + "]");
                     } catch (Exception ignored) {}
                 }
@@ -1147,20 +1164,20 @@ public class FtcFieldSimulatorApp extends Application {
                         script.append(AutonomousStep.waitStep(Double.parseDouble(wm.group(1).trim())).rawLine).append("\n");
                     }
                 } else {
-                    // Generic command - handles one level of nested parentheses for y() calls
-                    Pattern cmPattern = Pattern.compile("new\\s+(\\w+)\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
+                    // Generic command - handles nested parentheses for y(), fa(), h() calls
+                    Pattern cmPattern = Pattern.compile("new\\s+(\\w+)\\s*\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
                     Matcher cm = cmPattern.matcher(line);
                     if (cm.find()) {
                         String className = cm.group(1);
-                        String args = cm.group(2).trim();
+                        String argsStr = cm.group(2).trim();
                         
                         // Resolve mirror functions to raw field values for the script
-                        args = resolveMirrorFunctionsToFieldValues(args, isRed);
+                        argsStr = resolveMirrorFunctionsToFieldValues(argsStr, isRed);
                         
                         String stepName = "";
-                        Matcher nm = Pattern.compile("\\.withName\\(\"(.*?)\"\\)").matcher(line);
+                        Matcher nm = Pattern.compile("\\.withName\\s*\\(\\s*\"(.*?)\"\\s*\\)").matcher(line);
                         if (nm.find()) stepName = nm.group(1);
-                        script.append(AutonomousStep.command(className, args, stepName).rawLine).append("\n");
+                        script.append(AutonomousStep.command(className, argsStr, stepName).rawLine).append("\n");
                     }
                 }
             }
@@ -1211,8 +1228,8 @@ public class FtcFieldSimulatorApp extends Application {
     private String resolveMirrorFunctionsToFieldValues(String args, boolean isRed) {
         double allianceMultiplier = isRed ? -1.0 : 1.0;
         
-        // Resolve y()
-        Pattern yPattern = Pattern.compile("y\\(\\s*([\\d\\.\\-]+)\\s*\\)");
+        // Resolve y(...)
+        Pattern yPattern = Pattern.compile("y\\s*\\(\\s*([\\d\\.\\-]+)\\s*\\)");
         Matcher ym = yPattern.matcher(args);
         StringBuilder sb = new StringBuilder();
         int lastEnd = 0;
@@ -1225,8 +1242,8 @@ public class FtcFieldSimulatorApp extends Application {
         sb.append(args.substring(lastEnd));
         args = sb.toString();
 
-        // Resolve fa() - was h()
-        Pattern faPattern = Pattern.compile("fa\\(\\s*([\\d\\.\\-]+)\\s*\\)");
+        // Resolve fa(...) - Follow Angle logic (180 - val)
+        Pattern faPattern = Pattern.compile("fa\\s*\\(\\s*([\\d\\.\\-]+)\\s*\\)");
         Matcher fam = faPattern.matcher(args);
         sb = new StringBuilder();
         lastEnd = 0;
@@ -1240,8 +1257,8 @@ public class FtcFieldSimulatorApp extends Application {
         sb.append(args.substring(lastEnd));
         args = sb.toString();
 
-        // Resolve h() - new logic
-        Pattern hPattern = Pattern.compile("h\\(\\s*([\\d\\.\\-]+)\\s*\\)");
+        // Resolve h(...) - Heading logic (360 - val)
+        Pattern hPattern = Pattern.compile("h\\s*\\(\\s*([\\d\\.\\-]+)\\s*\\)");
         Matcher hm = hPattern.matcher(args);
         sb = new StringBuilder();
         lastEnd = 0;
@@ -1255,8 +1272,8 @@ public class FtcFieldSimulatorApp extends Application {
         sb.append(args.substring(lastEnd));
         args = sb.toString();
 
-        // Resolve reflectH()
-        Pattern rhPattern = Pattern.compile("reflectH\\(\\s*([\\d\\.\\-]+)\\s*,\\s*([\\d\\.\\-]+)\\s*\\)");
+        // Resolve reflectH(...)
+        Pattern rhPattern = Pattern.compile("reflectH\\s*\\(\\s*([\\d\\.\\-]+)\\s*,\\s*([\\d\\.\\-]+)\\s*\\)");
         Matcher rhm = rhPattern.matcher(args);
         sb = new StringBuilder();
         lastEnd = 0;
@@ -1415,13 +1432,23 @@ public class FtcFieldSimulatorApp extends Application {
                     
                     // Special case for SetInitialPoseCommand: wrap the second and third arguments
                     if ("SetInitialPoseCommand".equals(className)) {
-                        String[] argParts = args.split(",");
+                        String[] argParts = splitArgsIgnoreParens(args);
                         if (argParts.length >= 3) {
                             double py = Double.parseDouble(argParts[1].trim());
                             double hField = Double.parseDouble(argParts[2].trim());
                             argParts[1] = formatYForJava(py, allianceMultiplier);
                             argParts[2] = formatHForJava(hField, isRedAlliance);
                             args = String.join(", ", argParts);
+                        }
+                    } else if ("AutoIntakeCommand".equals(className)) {
+                        // Special case for AutoIntakeCommand (Husky Drive)
+                        String[] argParts = splitArgsIgnoreParens(args);
+                        if (argParts.length >= 1) {
+                            try {
+                                double hField = Double.parseDouble(argParts[0].trim());
+                                argParts[0] = formatHForJava(hField, isRedAlliance);
+                                args = String.join(", ", argParts);
+                            } catch (Exception ignored) {}
                         }
                     }
                     
@@ -1776,11 +1803,14 @@ public class FtcFieldSimulatorApp extends Application {
         if (controlPanel == null) return;
 
         boolean pathsExist = !allPaths.isEmpty();
+        boolean missionExists = missionSteps.stream().anyMatch(s -> 
+            s.type != AutonomousStep.Type.EMPTY && s.type != AutonomousStep.Type.COMMENT);
+
         controlPanel.updatePathSelectionComboBox(allPaths, selectedPath);
 
         boolean pathExistsAndNotEmpty = selectedPath != null && !selectedPath.points.isEmpty();
         controlPanel.setPointEditingControlsDisabled(!pathExistsAndNotEmpty);
-        controlPanel.enablePathControls(pathsExist);
+        controlPanel.enablePathControls(pathsExist, missionExists);
 
         Object selectionToRestore = controlPanel.getSelectedPointFromComboBox();
         if (!pathExistsAndNotEmpty) {

@@ -261,7 +261,7 @@ public class ControlPanel extends VBox {
         VBox toolsControlsBox = new VBox(SECTION_SPACING, showPlotButton);
 
         // --- Initial State ---
-        enablePathControls(false);
+        enablePathControls(false, false);
         setPlaybackControlsDisabled(true);
         setSaveButtonDisabled(true);
         setPointEditingControlsDisabled(true);
@@ -487,16 +487,16 @@ public class ControlPanel extends VBox {
         setSaveButtonDisabled(!isInReplayMode);
     }
 
-    public void enablePathControls(boolean pathExists) {
+    public void enablePathControls(boolean pathExists, boolean missionExists) {
         boolean pathEditingMode = newPathButton.isDisabled();
         deletePathButton.setDisable(!pathExists || pathEditingMode);
         prevPathButton.setDisable(!pathExists || pathEditingMode);
         nextPathButton.setDisable(!pathExists || pathEditingMode);
         importCodeButton.setDisable(pathEditingMode);
-        exportCodeButton.setDisable(!pathExists || pathEditingMode);
+        exportCodeButton.setDisable(!missionExists || pathEditingMode);
         if (sendMissionButton != null) {
-            sendMissionButton.setDisable(!pathExists || pathEditingMode);
-            ipAddressComboBox.setDisable(!pathExists || pathEditingMode); // Also disable the IP box if no path
+            sendMissionButton.setDisable(!missionExists || pathEditingMode);
+            ipAddressComboBox.setDisable(!missionExists || pathEditingMode); // Also disable the IP box if no mission
         }
     }
 
