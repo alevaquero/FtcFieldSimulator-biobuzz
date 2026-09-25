@@ -99,7 +99,7 @@ public class FtcFieldSimulatorApp extends Application {
     public static final double FIELD_HEIGHT_INCHES = 144.0;
     private static final int FIELD_DISPLAY_WIDTH_PIXELS = 800;
     private static final int FIELD_DISPLAY_HEIGHT_PIXELS = 800;
-    private static final String FIELD_IMAGE_PATH = "/decode_field.png";
+    private static final String FIELD_IMAGE_PATH = "/biobuzz_field.png";
     private static final String ROBOT_IMAGE_PATH = "/robot.png";
     public static final double FIELD_IMAGE_ALPHA = 0.3;
     public static final double BACKGROUND_ALPHA = 0.1;
